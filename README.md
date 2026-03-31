@@ -17,10 +17,9 @@ Version: `0.1`
 ## Technical notes
 
 - Single-file C++ Win32 application built with `zig c++`
-- Uses dynamically loaded NVIDIA driver interfaces available on the local machine
+- Uses NVIDIA driver interfaces available on the local machine
 - Uses public NVAPI entry points exposed by the installed driver
 - Uses NVML from the local NVIDIA driver install for supported management operations
-- Does not ship NVIDIA driver binaries
 - Optional debug logging exists, but normal release usage is intended to run without persistent logging output
 - Tiny
 
@@ -46,9 +45,7 @@ This project is provided under the MIT license, without warranty of any kind. Th
 
 - Green Curve is an unofficial third-party utility and is not affiliated with or endorsed by NVIDIA.
 - It relies on driver interfaces exposed on systems with NVIDIA drivers already installed.
-- The project should only distribute its own source and binaries, and should not bundle NVIDIA driver binaries unless a separate NVIDIA license clearly permits that.
 - NVIDIA names, product names, and trademarks remain the property of their respective owners.
-- Public NVAPI SDK materials published by NVIDIA are currently available under MIT terms for the SDK repository/import-library package, but that does not automatically authorize repackaging unrelated NVIDIA-owned binaries.
 
 ## Release readiness notes
 
