@@ -12,6 +12,7 @@ Latest version can be found in tags section.
 - Lets you edit visible curve points in a simple Win32 GDI UI
 - Supports point locking to flatten the tail of the curve after a chosen voltage point
 - Reads and writes global GPU clock offset, effective VRAM offset, power limit, and manual fan speed where supported
+- Also supports custom fan curve mode running in system tray with background process
 - Provides CLI modes for dump, JSON export, and probing driver capabilities
 
 ## Technical notes
