@@ -99,5 +99,7 @@ bool set_config_int(const char* path, const char* section, const char* key, int 
 
     char buf[32] = {};
     StringCchPrintfA(buf, ARRAY_COUNT(buf), "%d", value);
-    return WritePrivateProfileStringA(section, key, buf, path) != FALSE;
+    bool ok = WritePrivateProfileStringA(section, key, buf, path) != FALSE;
+    if (ok) invalidate_tray_profile_cache();
+    return ok;
 }

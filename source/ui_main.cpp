@@ -1026,7 +1026,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         }
 
         case WM_DESTROY:
-            stop_fan_curve_runtime();
+            stop_fan_curve_runtime(true);
             remove_tray_icon();
             close_startup_sync_thread_handle();
             destroy_backbuffer();

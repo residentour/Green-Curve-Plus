@@ -1,4 +1,4 @@
-// Green Curve v0.3 - NVIDIA Blackwell VF Curve Editor
+// Green Curve v0.5 - NVIDIA Blackwell VF Curve Editor
 // Win32 GDI application
 
 #include "app_shared.h"
@@ -105,8 +105,10 @@ static bool nvml_set_fan_manual(int pct, bool* exactApplied, char* detail, size_
 static void initialize_gui_fan_settings_from_live_state();
 static int get_effective_live_fan_mode();
 static bool fan_setting_matches_current(int wantMode, int wantPct, const FanCurveConfig* wantCurve);
+static bool nvml_manual_fan_matches_target(int pct, bool* matches, char* detail, size_t detailSize);
 static void update_fan_controls_enabled_state();
 static void update_tray_icon();
+static void ensure_tray_profile_cache();
 static bool ensure_tray_icon();
 static void remove_tray_icon();
 static void hide_main_window_to_tray();
@@ -114,7 +116,7 @@ static void show_main_window_from_tray();
 static void show_tray_menu(HWND hwnd);
 static bool live_state_has_custom_oc();
 static bool live_state_has_custom_fan();
-static void stop_fan_curve_runtime();
+static void stop_fan_curve_runtime(bool restoreFanAutoOnExit = false);
 static void start_fan_curve_runtime();
 static void start_fixed_fan_runtime();
 static void apply_fan_curve_tick();
@@ -209,20 +211,74 @@ static void desired_mode_label(const DesiredSettings* desired, char* mode, size_
     }
 }
 
+void invalidate_tray_profile_cache() {
+    g_app.trayProfileCacheValid = false;
+    g_app.trayProfileCacheHasMode = false;
+    g_app.trayProfileCacheCustomOc = false;
+    g_app.trayProfileCacheCustomFan = false;
+    g_app.trayLastRenderedValid = false;
+    g_app.trayLastRenderedState = TRAY_ICON_STATE_DEFAULT;
+    g_app.trayProfileCacheMode[0] = 0;
+    g_app.trayProfileCacheProfilePart[0] = 0;
+    g_app.trayLastRenderedTip[0] = 0;
+}
+
+static void ensure_tray_profile_cache() {
+    if (g_app.trayProfileCacheValid) return;
+
+    g_app.trayProfileCacheValid = true;
+    g_app.trayProfileCacheHasMode = false;
+    g_app.trayProfileCacheCustomOc = false;
+    g_app.trayProfileCacheCustomFan = false;
+    g_app.trayProfileCacheMode[0] = 0;
+    g_app.trayProfileCacheProfilePart[0] = 0;
+
+    int selectedSlot = CONFIG_DEFAULT_SLOT;
+    bool hasConfigPath = g_app.configPath[0] != '\0';
+    if (hasConfigPath) {
+        selectedSlot = get_config_int(g_app.configPath, "profiles", "selected_slot", CONFIG_DEFAULT_SLOT);
+    }
+    if (selectedSlot < 1 || selectedSlot > CONFIG_NUM_SLOTS) {
+        selectedSlot = CONFIG_DEFAULT_SLOT;
+    }
+
+    if (!hasConfigPath) {
+        StringCchPrintfA(
+            g_app.trayProfileCacheProfilePart,
+            ARRAY_COUNT(g_app.trayProfileCacheProfilePart),
+            "Profile %d",
+            selectedSlot);
+        return;
+    }
+
+    bool hasSavedProfile = is_profile_slot_saved(g_app.configPath, selectedSlot);
+    StringCchPrintfA(
+        g_app.trayProfileCacheProfilePart,
+        ARRAY_COUNT(g_app.trayProfileCacheProfilePart),
+        "Profile %d (%s)",
+        selectedSlot,
+        hasSavedProfile ? "saved" : "empty");
+
+    if (!hasSavedProfile) return;
+
+    DesiredSettings desired = {};
+    char err[256] = {};
+    if (!load_profile_from_config(g_app.configPath, selectedSlot, &desired, err, sizeof(err))) return;
+
+    desired_mode_label(&desired, g_app.trayProfileCacheMode, sizeof(g_app.trayProfileCacheMode));
+    g_app.trayProfileCacheHasMode = true;
+    g_app.trayProfileCacheCustomOc = desired_has_custom_oc(&desired);
+    g_app.trayProfileCacheCustomFan = desired.hasFan && desired.fanMode != FAN_MODE_AUTO;
+}
+
 static void resolve_tray_icon_state(bool* customOcOut, bool* customFanOut) {
     bool customOc = live_state_has_custom_oc();
     bool customFan = live_state_has_custom_fan();
 
-    if (g_app.configPath[0] != '\0') {
-        int selectedSlot = get_config_int(g_app.configPath, "profiles", "selected_slot", CONFIG_DEFAULT_SLOT);
-        if (selectedSlot >= 1 && selectedSlot <= CONFIG_NUM_SLOTS && is_profile_slot_saved(g_app.configPath, selectedSlot)) {
-            DesiredSettings desired = {};
-            char err[256] = {};
-            if (load_profile_from_config(g_app.configPath, selectedSlot, &desired, err, sizeof(err))) {
-                customOc = desired_has_custom_oc(&desired);
-                customFan = desired.hasFan && desired.fanMode != FAN_MODE_AUTO;
-            }
-        }
+    ensure_tray_profile_cache();
+    if (g_app.trayProfileCacheHasMode) {
+        customOc = g_app.trayProfileCacheCustomOc;
+        customFan = g_app.trayProfileCacheCustomFan;
     }
 
     if (customOcOut) *customOcOut = customOc;
@@ -232,40 +288,20 @@ static void resolve_tray_icon_state(bool* customOcOut, bool* customFanOut) {
 static void build_tray_tooltip(char* tip, size_t tipSize) {
     if (!tip || tipSize == 0) return;
 
-    int selectedSlot = CONFIG_DEFAULT_SLOT;
-    bool hasConfigPath = g_app.configPath[0] != '\0';
-    bool hasSavedProfile = false;
-    bool haveProfileMode = false;
+    ensure_tray_profile_cache();
+
     char mode[64] = {};
-    if (hasConfigPath) {
-        selectedSlot = get_config_int(g_app.configPath, "profiles", "selected_slot", CONFIG_DEFAULT_SLOT);
-    }
-    if (selectedSlot < 1 || selectedSlot > CONFIG_NUM_SLOTS) {
-        selectedSlot = CONFIG_DEFAULT_SLOT;
-    }
-
-    char profilePart[64] = {};
-    if (hasConfigPath) {
-        hasSavedProfile = is_profile_slot_saved(g_app.configPath, selectedSlot);
-        StringCchPrintfA(profilePart, ARRAY_COUNT(profilePart), "Profile %d (%s)", selectedSlot, hasSavedProfile ? "saved" : "empty");
-        if (hasSavedProfile) {
-            DesiredSettings desired = {};
-            char err[256] = {};
-            if (load_profile_from_config(g_app.configPath, selectedSlot, &desired, err, sizeof(err))) {
-                desired_mode_label(&desired, mode, sizeof(mode));
-                haveProfileMode = true;
-            }
-        }
+    if (g_app.trayProfileCacheHasMode) {
+        StringCchCopyA(mode, ARRAY_COUNT(mode), g_app.trayProfileCacheMode);
     } else {
-        StringCchPrintfA(profilePart, ARRAY_COUNT(profilePart), "Profile %d", selectedSlot);
-    }
-
-    if (!haveProfileMode) {
         bool customOc = live_state_has_custom_oc();
         bool customFan = live_state_has_custom_fan();
         StringCchCopyA(mode, ARRAY_COUNT(mode), tray_mode_label(customOc, customFan));
     }
 
+    const char* profilePart = g_app.trayProfileCacheProfilePart[0]
+        ? g_app.trayProfileCacheProfilePart
+        : "Profile 1";
     StringCchPrintfA(tip, tipSize, "Green Curve - %s | %s", mode, profilePart);
 }
 
@@ -519,7 +555,16 @@ static void update_tray_icon() {
     }
     g_app.trayIconState = state;
 
+    char tip[128] = {};
+    build_tray_tooltip(tip, sizeof(tip));
+
     if (!g_app.trayIconAdded) return;
+
+    if (g_app.trayLastRenderedValid &&
+        g_app.trayLastRenderedState == state &&
+        strcmp(g_app.trayLastRenderedTip, tip) == 0) {
+        return;
+    }
 
     NOTIFYICONDATAA nid = {};
     nid.cbSize = sizeof(nid);
@@ -527,10 +572,14 @@ static void update_tray_icon() {
     nid.uID = 1;
     nid.uFlags = NIF_ICON | NIF_TIP | NIF_SHOWTIP;
     nid.hIcon = g_app.trayIcons[state] ? g_app.trayIcons[state] : LoadIcon(nullptr, IDI_APPLICATION);
-    char tip[128] = {};
-    build_tray_tooltip(tip, sizeof(tip));
     StringCchCopyA(nid.szTip, ARRAY_COUNT(nid.szTip), tip);
-    Shell_NotifyIconA(NIM_MODIFY, &nid);
+    if (Shell_NotifyIconA(NIM_MODIFY, &nid)) {
+        g_app.trayLastRenderedValid = true;
+        g_app.trayLastRenderedState = state;
+        StringCchCopyA(g_app.trayLastRenderedTip, ARRAY_COUNT(g_app.trayLastRenderedTip), tip);
+    } else {
+        g_app.trayLastRenderedValid = false;
+    }
 }
 
 static bool ensure_tray_icon() {
@@ -565,6 +614,7 @@ static void remove_tray_icon() {
     nid.uID = 1;
     Shell_NotifyIconA(NIM_DELETE, &nid);
     g_app.trayIconAdded = false;
+    g_app.trayLastRenderedValid = false;
 }
 
 static void hide_main_window_to_tray() {
@@ -727,7 +777,14 @@ static void handle_fan_runtime_failure(const char* action, const char* detail) {
     update_tray_icon();
 }
 
-static void stop_fan_curve_runtime() {
+static void stop_fan_curve_runtime(bool restoreFanAutoOnExit) {
+    if (restoreFanAutoOnExit && (g_app.fanCurveRuntimeActive || g_app.fanFixedRuntimeActive)) {
+        char detail[128] = {};
+        if (g_app.fanSupported && !g_app.fanIsAuto && nvml_set_fan_auto(detail, sizeof(detail))) {
+            g_app.fanIsAuto = true;
+        }
+    }
+
     if (g_app.hMainWnd) {
         KillTimer(g_app.hMainWnd, FAN_CURVE_TIMER_ID);
     }
@@ -771,6 +828,23 @@ static void apply_fan_curve_tick() {
 
     if (g_app.fanFixedRuntimeActive) {
         int targetPercent = clamp_percent(g_app.activeFanFixedPercent);
+        bool needsReapply = (g_app.fanRuntimeLastApplyTickMs == 0) ||
+            ((now - g_app.fanRuntimeLastApplyTickMs) >= FAN_RUNTIME_REAPPLY_INTERVAL_MS);
+        if (!needsReapply) {
+            bool matches = false;
+            char detail[128] = {};
+            if (!nvml_manual_fan_matches_target(targetPercent, &matches, detail, sizeof(detail))) {
+                handle_fan_runtime_failure("Fixed fan runtime verify failed", detail);
+                return;
+            }
+            if (matches) {
+                g_app.activeFanMode = FAN_MODE_FIXED;
+                g_app.activeFanFixedPercent = targetPercent;
+                g_app.fanRuntimeConsecutiveFailures = 0;
+                return;
+            }
+        }
+
         bool exact = false;
         char detail[128] = {};
         if (!nvml_set_fan_manual(targetPercent, &exact, detail, sizeof(detail)) || !exact) {
@@ -784,7 +858,6 @@ static void apply_fan_curve_tick() {
         g_app.activeFanMode = FAN_MODE_FIXED;
         g_app.activeFanFixedPercent = targetPercent;
         mark_fan_runtime_success(now);
-        update_tray_icon();
         return;
     }
 
@@ -833,7 +906,6 @@ static void apply_fan_curve_tick() {
     g_app.fanCurveLastAppliedTempC = currentTempC;
     g_app.fanCurveHasLastAppliedTemp = true;
     mark_fan_runtime_success(now);
-    update_tray_icon();
 }
 
 static void start_fan_curve_runtime() {
@@ -1017,6 +1089,7 @@ static void set_default_config_path() {
         StringCchCopyA(path, ARRAY_COUNT(path), CONFIG_FILE_NAME);
     }
     StringCchCopyA(g_app.configPath, ARRAY_COUNT(g_app.configPath), path);
+    invalidate_tray_profile_cache();
 }
 
 static const char* nvml_err_name(nvmlReturn_t r) {
@@ -2616,6 +2689,34 @@ static bool nvml_set_fan_manual(int pct, bool* exactApplied, char* detail, size_
     return true;
 }
 
+static bool nvml_manual_fan_matches_target(int pct, bool* matches, char* detail, size_t detailSize) {
+    if (matches) *matches = false;
+    if (!nvml_read_fans(detail, detailSize)) return false;
+    if (g_app.fanCount == 0) {
+        set_message(detail, detailSize, "No fans detected");
+        return false;
+    }
+    if (g_app.fanIsAuto) {
+        set_message(detail, detailSize, "Driver fan policy reverted to auto");
+        return true;
+    }
+
+    bool ok = true;
+    for (unsigned int fan = 0; fan < g_app.fanCount; fan++) {
+        int got = (int)g_app.fanPercent[fan];
+        if (pct == 0) {
+            if (got != 0) ok = false;
+        } else if (got < pct - 2 || got > pct + 2) {
+            ok = false;
+        }
+    }
+    if (!ok) {
+        set_message(detail, detailSize, "Fan readback did not confirm %d%%", pct);
+    }
+    if (matches) *matches = ok;
+    return true;
+}
+
 static bool fan_setting_matches_current(int wantMode, int wantPct, const FanCurveConfig* wantCurve) {
     if (!g_app.fanSupported) return false;
     if (wantMode != g_app.activeFanMode) return false;
@@ -3050,6 +3151,7 @@ static bool save_desired_to_config_with_startup(const char* path, const DesiredS
         }
     }
 
+    invalidate_tray_profile_cache();
     return true;
 }
 

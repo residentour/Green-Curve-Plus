@@ -59,7 +59,7 @@ static bool handle_cli(LPWSTR wCmdLine) {
     CLI_LOG("Green Curve CLI mode started\n");
 
     if (opts.showHelp) {
-        CLI_LOG("Green Curve v0.3 - NVIDIA Blackwell VF Curve Editor\n");
+        CLI_LOG(APP_NAME " v" APP_VERSION " - NVIDIA Blackwell VF Curve Editor\n");
         CLI_LOG("Usage:\n");
         CLI_LOG("  greencurve.exe              Launch GUI\n");
         CLI_LOG("  greencurve.exe --dump       Write VF curve to greencurve_cli_log.txt\n");
@@ -451,6 +451,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE /*hPrev*/, LPSTR /*lpCmdLine*/
     LPWSTR wCmdLine = GetCommandLineW();
 
     g_debug_logging = (GetEnvironmentVariableA(APP_DEBUG_ENV, nullptr, 0) > 0);
+    SetPriorityClass(GetCurrentProcess(), NORMAL_PRIORITY_CLASS);
 
     // CLI mode - handle --dump, --json, --help
     if (handle_cli(wCmdLine)) {

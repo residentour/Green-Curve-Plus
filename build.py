@@ -4,9 +4,10 @@
 """Build script for Green Curve.
 
 Downloads Zig if needed, generates the app icon, compiles resources,
-then builds ``greencurve.exe``.
+then builds ``greencurve.exe``. Linux cross-builds use a separate source set.
 """
 
+import argparse
 import math
 import os
 import struct
@@ -24,15 +25,24 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 ZIG_DIR = os.path.join(SCRIPT_DIR, "zig")
 ZIG_EXE = os.path.join(ZIG_DIR, "zig.exe")
 SOURCE_DIR = os.path.join(SCRIPT_DIR, "source")
-SOURCE_FILES = [
+WINDOWS_SOURCE_FILES = [
     os.path.join(SOURCE_DIR, "main.cpp"),
     os.path.join(SOURCE_DIR, "app_shared.cpp"),
     os.path.join(SOURCE_DIR, "config_utils.cpp"),
     os.path.join(SOURCE_DIR, "fan_curve.cpp"),
 ]
-OUTPUT_EXE = os.path.join(SCRIPT_DIR, "greencurve.exe")
-TEMP_OUTPUT_EXE = OUTPUT_EXE + ".new"
-BACKUP_EXE = OUTPUT_EXE + ".bak"
+LINUX_SOURCE_FILES = [
+    os.path.join(SOURCE_DIR, "linux_main.cpp"),
+    os.path.join(SOURCE_DIR, "linux_port.cpp"),
+    os.path.join(SOURCE_DIR, "linux_tui.cpp"),
+]
+WINDOWS_OUTPUT_EXE = os.path.join(SCRIPT_DIR, "greencurve.exe")
+WINDOWS_TEMP_OUTPUT_EXE = WINDOWS_OUTPUT_EXE + ".new"
+WINDOWS_BACKUP_EXE = WINDOWS_OUTPUT_EXE + ".bak"
+LINUX_TARGET = "x86_64-linux-musl"
+LINUX_OUTPUT_BIN = os.path.join(SCRIPT_DIR, f"greencurve-{LINUX_TARGET}")
+LINUX_TEMP_OUTPUT_BIN = LINUX_OUTPUT_BIN + ".new"
+LINUX_BACKUP_BIN = LINUX_OUTPUT_BIN + ".bak"
 ICON_ICO = os.path.join(SCRIPT_DIR, "greencurve.ico")
 TRAY_ICON_DEFAULT_ICO = os.path.join(SCRIPT_DIR, "greencurve_tray_default.ico")
 TRAY_ICON_OC_ICO = os.path.join(SCRIPT_DIR, "greencurve_tray_oc.ico")
@@ -58,11 +68,20 @@ COMMON_FLAGS = [
     "-ffunction-sections",
     "-fdata-sections",
     f"-I{SOURCE_DIR}",
-    "-Wl,--subsystem,windows",
     "-Wl,--gc-sections",
 ]
 
-LINK_LIBS = [
+WINDOWS_FLAGS = [
+    "-Wl,--subsystem,windows",
+]
+
+LINUX_FLAGS = [
+    "-target",
+    LINUX_TARGET,
+    "-static",
+]
+
+WINDOWS_LINK_LIBS = [
     "-luser32",
     "-lgdi32",
     "-ladvapi32",
@@ -480,9 +499,43 @@ def download_zig():
     print(f"Zig installed at {ZIG_EXE}")
 
 
-def compile_binary():
-    """Compile the C++ sources using Zig's bundled clang."""
-    missing_sources = [path for path in SOURCE_FILES if not os.path.exists(path)]
+def finalize_output(temp_output, output_path, backup_path=None):
+    if not os.path.exists(temp_output):
+        print(f"Compilation reported success but {temp_output} is missing")
+        sys.exit(1)
+
+    if backup_path and os.path.exists(backup_path):
+        os.remove(backup_path)
+
+    replaced_existing = False
+    if os.path.exists(output_path):
+        try:
+            if backup_path:
+                os.replace(output_path, backup_path)
+            else:
+                os.remove(output_path)
+            replaced_existing = True
+        except OSError as exc:
+            print(f"WARNING: Could not replace existing output: {exc}")
+            print(f"Built file kept at: {temp_output}")
+            sys.exit(1)
+
+    try:
+        os.replace(temp_output, output_path)
+    except OSError as exc:
+        if backup_path and replaced_existing and os.path.exists(backup_path) and not os.path.exists(output_path):
+            os.replace(backup_path, output_path)
+        print(f"Failed to finalize output: {exc}")
+        print(f"Built file kept at: {temp_output}")
+        sys.exit(1)
+
+    size = os.path.getsize(output_path)
+    print(f"Build successful: {output_path} ({size:,} bytes / {size / 1024:.1f} KB)")
+
+
+def compile_windows_binary():
+    """Compile the Windows GUI executable using Zig's bundled clang."""
+    missing_sources = [path for path in WINDOWS_SOURCE_FILES if not os.path.exists(path)]
     if missing_sources:
         print("ERROR: Missing source files:")
         for path in missing_sources:
@@ -492,69 +545,88 @@ def compile_binary():
     generate_icon()
     compile_resources()
 
-    if os.path.exists(TEMP_OUTPUT_EXE):
-        os.remove(TEMP_OUTPUT_EXE)
+    if os.path.exists(WINDOWS_TEMP_OUTPUT_EXE):
+        os.remove(WINDOWS_TEMP_OUTPUT_EXE)
 
     cmd = [
         ZIG_EXE,
         "c++",
         *COMMON_FLAGS,
+        *WINDOWS_FLAGS,
         "-o",
-        TEMP_OUTPUT_EXE,
-        *SOURCE_FILES,
+        WINDOWS_TEMP_OUTPUT_EXE,
+        *WINDOWS_SOURCE_FILES,
         ICON_RES,
-        *LINK_LIBS,
+        *WINDOWS_LINK_LIBS,
     ]
 
-    print(f"Compiling {len(SOURCE_FILES)} source files -> {os.path.basename(OUTPUT_EXE)}")
+    print(f"Compiling {len(WINDOWS_SOURCE_FILES)} source files -> {os.path.basename(WINDOWS_OUTPUT_EXE)}")
     print(f"  Command: {' '.join(cmd)}")
 
     result = subprocess.run(cmd, cwd=SCRIPT_DIR)
     if result.returncode != 0:
-        if os.path.exists(TEMP_OUTPUT_EXE):
-            os.remove(TEMP_OUTPUT_EXE)
+        if os.path.exists(WINDOWS_TEMP_OUTPUT_EXE):
+            os.remove(WINDOWS_TEMP_OUTPUT_EXE)
         print("Compilation FAILED")
         sys.exit(1)
 
-    if not os.path.exists(TEMP_OUTPUT_EXE):
-        print(f"Compilation reported success but {TEMP_OUTPUT_EXE} is missing")
+    finalize_output(WINDOWS_TEMP_OUTPUT_EXE, WINDOWS_OUTPUT_EXE, WINDOWS_BACKUP_EXE)
+
+
+def compile_linux_binary():
+    """Cross-compile the Linux terminal build as a static musl binary."""
+    missing_sources = [path for path in LINUX_SOURCE_FILES if not os.path.exists(path)]
+    if missing_sources:
+        print("ERROR: Missing Linux source files:")
+        for path in missing_sources:
+            print(f"  {path}")
         sys.exit(1)
 
-    if os.path.exists(BACKUP_EXE):
-        os.remove(BACKUP_EXE)
+    if os.path.exists(LINUX_TEMP_OUTPUT_BIN):
+        os.remove(LINUX_TEMP_OUTPUT_BIN)
 
-    replaced_existing = False
-    if os.path.exists(OUTPUT_EXE):
-        try:
-            os.replace(OUTPUT_EXE, BACKUP_EXE)
-            replaced_existing = True
-        except OSError as exc:
-            print(f"WARNING: Could not replace existing output: {exc}")
-            print(f"Built file kept at: {TEMP_OUTPUT_EXE}")
-            print("Close any running greencurve.exe and rename the .new file manually.")
-            sys.exit(1)
+    cmd = [
+        ZIG_EXE,
+        "c++",
+        *COMMON_FLAGS,
+        *LINUX_FLAGS,
+        "-o",
+        LINUX_TEMP_OUTPUT_BIN,
+        *LINUX_SOURCE_FILES,
+    ]
 
-    try:
-        os.replace(TEMP_OUTPUT_EXE, OUTPUT_EXE)
-    except OSError as exc:
-        if (
-            replaced_existing
-            and os.path.exists(BACKUP_EXE)
-            and not os.path.exists(OUTPUT_EXE)
-        ):
-            os.replace(BACKUP_EXE, OUTPUT_EXE)
-        print(f"Failed to finalize output: {exc}")
-        print(f"Built file kept at: {TEMP_OUTPUT_EXE}")
+    print(f"Compiling {len(LINUX_SOURCE_FILES)} source files -> {os.path.basename(LINUX_OUTPUT_BIN)}")
+    print(f"  Command: {' '.join(cmd)}")
+
+    result = subprocess.run(cmd, cwd=SCRIPT_DIR)
+    if result.returncode != 0:
+        if os.path.exists(LINUX_TEMP_OUTPUT_BIN):
+            os.remove(LINUX_TEMP_OUTPUT_BIN)
+        print("Compilation FAILED")
         sys.exit(1)
 
-    size = os.path.getsize(OUTPUT_EXE)
-    print(f"Build successful: {OUTPUT_EXE} ({size:,} bytes / {size / 1024:.1f} KB)")
+    finalize_output(LINUX_TEMP_OUTPUT_BIN, LINUX_OUTPUT_BIN, LINUX_BACKUP_BIN)
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Build Green Curve targets with Zig")
+    parser.add_argument(
+        "--target",
+        choices=("windows", "linux", "all"),
+        default="windows",
+        help="Which target to build (default: windows)",
+    )
+    return parser.parse_args()
 
 
 def main():
+    args = parse_args()
     print("=== Green Curve build ===")
     download_zig()
-    compile_binary()
+    if args.target in ("windows", "all"):
+        compile_windows_binary()
+    if args.target in ("linux", "all"):
+        compile_linux_binary()
     print("=== Done ===")
 
 

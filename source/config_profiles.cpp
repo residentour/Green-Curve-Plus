@@ -325,7 +325,10 @@ static bool save_profile_to_config(const char* path, int slot, const DesiredSett
     appendf("[startup]\r\napply_on_launch=%d\r\nstart_program_on_logon=%d\r\n\r\n", logonSlot > 0 ? 1 : 0, startOnLogon ? 1 : 0);
 
     bool ok = write_text_file_atomic(path, cfg, used, err, errSize);
-    if (ok) WritePrivateProfileStringA(NULL, NULL, NULL, NULL);
+    if (ok) {
+        WritePrivateProfileStringA(NULL, NULL, NULL, NULL);
+        invalidate_tray_profile_cache();
+    }
     return ok;
 }
 
@@ -407,7 +410,10 @@ static bool clear_profile_from_config(const char* path, int slot, char* err, siz
     appendf("[startup]\r\napply_on_launch=%d\r\nstart_program_on_logon=%d\r\n\r\n", logonSlot > 0 ? 1 : 0, startOnLogon ? 1 : 0);
 
     bool ok2 = write_text_file_atomic(path, cfg, used, err, errSize);
-    if (ok2) WritePrivateProfileStringA(NULL, NULL, NULL, NULL);
+    if (ok2) {
+        WritePrivateProfileStringA(NULL, NULL, NULL, NULL);
+        invalidate_tray_profile_cache();
+    }
     return ok2;
 }
 

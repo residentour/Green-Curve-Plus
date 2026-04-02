@@ -47,7 +47,7 @@ void init_dpi();
 #define TRAY_ICON_FAN_ID    113
 #define TRAY_ICON_OC_FAN_ID 114
 #define APP_NAME            "Green Curve"
-#define APP_VERSION         "0.4"
+#define APP_VERSION         "0.5"
 #define APP_TITLE           APP_NAME " v" APP_VERSION
 #define APP_CLASS_NAME      "GreenCurveClass"
 #define APP_EXE_NAME        "greencurve.exe"
@@ -439,6 +439,15 @@ struct AppData {
     bool trayIconAdded;
     int trayIconState;
     HICON trayIcons[4];
+    bool trayProfileCacheValid;
+    bool trayProfileCacheHasMode;
+    bool trayProfileCacheCustomOc;
+    bool trayProfileCacheCustomFan;
+    bool trayLastRenderedValid;
+    int trayLastRenderedState;
+    char trayProfileCacheMode[64];
+    char trayProfileCacheProfilePart[64];
+    char trayLastRenderedTip[128];
 };
 
 struct DesiredSettings {
@@ -559,5 +568,6 @@ bool parse_fan_value(const char* text, bool* isAuto, int* pct);
 bool config_section_has_keys(const char* path, const char* section);
 int get_config_int(const char* path, const char* section, const char* key, int defaultVal);
 bool set_config_int(const char* path, const char* section, const char* key, int value);
+void invalidate_tray_profile_cache();
 
 #endif
