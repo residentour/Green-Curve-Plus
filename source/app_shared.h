@@ -1,4 +1,4 @@
-﻿#ifndef GREEN_CURVE_APP_SHARED_H
+#ifndef GREEN_CURVE_APP_SHARED_H
 #define GREEN_CURVE_APP_SHARED_H
 
 #ifndef _WIN32_WINNT
@@ -52,7 +52,7 @@ void init_dpi();
 #define TRAY_ICON_FAN_ID    113
 #define TRAY_ICON_OC_FAN_ID 114
 #define APP_NAME            "Green Curve"
-#define APP_VERSION         "0.7"
+#define APP_VERSION         "0.8"
 #define APP_TITLE           APP_NAME " v" APP_VERSION
 #define APP_CLASS_NAME      "GreenCurveClass"
 #define APP_EXE_NAME        "greencurve.exe"
@@ -91,6 +91,7 @@ void init_dpi();
 #define TRAY_MENU_APPLY_AND_EXIT_ID        2102
 #define TRAY_MENU_APPLY_AND_EXIT_TIMER_ID  3
 #define APPLY_AND_EXIT_CHECK_ID 2035
+#define LOGON_HINT_ID       2036
 
 #define FAN_CURVE_TIMER_ID  1
 #define FAN_CURVE_MAX_POINTS 8
@@ -410,6 +411,7 @@ struct AppData {
     HWND hLogonLabel;
     HWND hProfileStatusLabel;
     HWND hStartOnLogonCheck;
+    HWND hLogonHintLabel;
     HWND hApplyAndExitCheck;
 
     HBRUSH hWindowClassBrush;

@@ -1,4 +1,4 @@
-﻿// Green Curve v0.7 - NVIDIA VF Curve Editor
+// Green Curve v0.7 - NVIDIA VF Curve Editor
 // Win32 GDI application
 
 #include "app_shared.h"
@@ -1384,9 +1384,10 @@ static int layout_bottom_buttons_y() {
 static int layout_bottom_panel_bottom_y() {
     int buttonsY = layout_bottom_buttons_y();
     int profileY = buttonsY + dp(40);
-    int autoY = profileY + dp(34);
-    // statusY must be below hApplyAndExitCheck (autoY+28, height 24) -> autoY+52 minimum
-    int statusY = autoY + dp(56);
+    int autoY    = profileY + dp(34);        // AppLaunch + Logon combo row (h=28)
+    int applyExitY = autoY + dp(34);         // "Apply Profile and Exit" own row (h=24)
+    int hintY    = applyExitY + dp(30);      // logon hint label (h=34, 2 lines)
+    int statusY  = hintY + dp(40);           // profile status label (h=18)
     return statusY + dp(18);
 }
 
@@ -1441,10 +1442,12 @@ static void layout_bottom_buttons(HWND hParent) {
     const int buttonH = dp(30);
     const int smallButtonW = dp(76);
     const int comboDropH = dp(220);
-    const int buttonsY = layout_bottom_buttons_y();
-    const int profileY = buttonsY + dp(40);
-    const int autoY = profileY + dp(34);
-    const int statusY = autoY + dp(56);
+    const int buttonsY    = layout_bottom_buttons_y();
+    const int profileY    = buttonsY + dp(40);
+    const int autoY       = profileY + dp(34);   // AppLaunch + Logon combo row
+    const int applyExitY  = autoY + dp(34);      // "Apply Profile and Exit" own row
+    const int hintY       = applyExitY + dp(30); // logon hint label
+    const int statusY     = hintY + dp(40);      // profile status label
 
     if (g_app.hApplyBtn)
         SetWindowPos(g_app.hApplyBtn, nullptr, margin, buttonsY, dp(132), buttonH, SWP_NOZORDER);
@@ -1482,7 +1485,9 @@ static void layout_bottom_buttons(HWND hParent) {
     if (g_app.hStartOnLogonCheck)
         SetWindowPos(g_app.hStartOnLogonCheck, nullptr, margin + dp(760), autoY + dp(2), dp(320), dp(24), SWP_NOZORDER);
     if (g_app.hApplyAndExitCheck)
-        SetWindowPos(g_app.hApplyAndExitCheck, nullptr, margin + dp(760), autoY + dp(28), dp(320), dp(24), SWP_NOZORDER);
+        SetWindowPos(g_app.hApplyAndExitCheck, nullptr, margin, applyExitY, dp(320), dp(24), SWP_NOZORDER);
+    if (g_app.hLogonHintLabel)
+        SetWindowPos(g_app.hLogonHintLabel, nullptr, margin, hintY, nvmax(dp(320), rc.right - margin * 2), dp(34), SWP_NOZORDER);
     if (g_app.hProfileStatusLabel)
         SetWindowPos(g_app.hProfileStatusLabel, nullptr, margin, statusY, nvmax(dp(300), rc.right - margin * 2), dp(18), SWP_NOZORDER);
 }
@@ -3010,13 +3015,10 @@ static bool write_startup_task_xml(const WCHAR* xmlPath, const WCHAR* exePath, c
         return false;
     }
 
-    const bool residentRuntimeRequired = logon_profile_requires_resident_runtime(g_app.configPath);
-    const bool launchProgramAtLogon = is_start_on_logon_enabled(g_app.configPath) || residentRuntimeRequired;
-    const WCHAR* description = residentRuntimeRequired
-        ? L"Launch Green Curve in the tray at user logon to maintain manual fan control."
-        : (launchProgramAtLogon
-            ? L"Launch Green Curve in the tray at user logon."
-            : L"Apply Green Curve startup settings at user logon.");
+    const bool launchProgramAtLogon = is_start_on_logon_enabled(g_app.configPath);
+    const WCHAR* description = launchProgramAtLogon
+        ? L"Launch Green Curve in the tray at user logon."
+        : L"Apply Green Curve profile settings silently at user logon.";
 
     HANDLE h = CreateFileW(xmlPath, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_TEMPORARY, nullptr);
     if (h == INVALID_HANDLE_VALUE) {
@@ -3209,22 +3211,19 @@ static void sync_logon_combo_from_system() {
     int logonSlot = get_config_int(g_app.configPath, "profiles", "logon_slot", 0);
     if (logonSlot < 0 || logonSlot > CONFIG_NUM_SLOTS) logonSlot = 0;
     bool shouldEnableTask = should_enable_startup_task_from_config(g_app.configPath);
-    bool residentRuntimeRequired = logon_profile_requires_resident_runtime(g_app.configPath);
     bool taskExists = is_startup_task_enabled();
 
     if (logonSlot > 0 && !is_profile_slot_saved(g_app.configPath, logonSlot)) {
         logonSlot = 0;
         set_config_int(g_app.configPath, "profiles", "logon_slot", 0);
         shouldEnableTask = should_enable_startup_task_from_config(g_app.configPath);
-        residentRuntimeRequired = false;
     }
 
-    if (shouldEnableTask && (!taskExists || residentRuntimeRequired)) {
+    if (shouldEnableTask || taskExists) {
         char err[256] = {};
-        if (!set_startup_task_enabled(true, err, sizeof(err)) && err[0]) {
+        if (!set_startup_task_enabled(shouldEnableTask, err, sizeof(err)) && err[0]) {
             debug_log("startup task sync failed: %s\n", err);
         }
-        taskExists = is_startup_task_enabled();
     }
     SendMessageA(g_app.hLogonCombo, CB_SETCURSEL, (WPARAM)logonSlot, 0);
     update_profile_state_label();
@@ -3235,22 +3234,19 @@ static DWORD WINAPI logon_sync_thread_proc(void* param) {
     int logonSlot = get_config_int(g_app.configPath, "profiles", "logon_slot", 0);
     if (logonSlot < 0 || logonSlot > CONFIG_NUM_SLOTS) logonSlot = 0;
     bool shouldEnableTask = should_enable_startup_task_from_config(g_app.configPath);
-    bool residentRuntimeRequired = logon_profile_requires_resident_runtime(g_app.configPath);
     bool taskExists = is_startup_task_enabled();
 
     if (logonSlot > 0 && !is_profile_slot_saved(g_app.configPath, logonSlot)) {
         logonSlot = 0;
         set_config_int(g_app.configPath, "profiles", "logon_slot", 0);
         shouldEnableTask = should_enable_startup_task_from_config(g_app.configPath);
-        residentRuntimeRequired = false;
     }
 
-    if (shouldEnableTask && (!taskExists || residentRuntimeRequired)) {
+    if (shouldEnableTask || taskExists) {
         char err[256] = {};
-        if (!set_startup_task_enabled(true, err, sizeof(err)) && err[0]) {
+        if (!set_startup_task_enabled(shouldEnableTask, err, sizeof(err)) && err[0]) {
             debug_log("startup task sync failed: %s\n", err);
         }
-        taskExists = is_startup_task_enabled();
     }
     PostMessageA(hwnd, APP_WM_SYNC_STARTUP, (WPARAM)logonSlot, 0);
     return 0;
