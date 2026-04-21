@@ -7,7 +7,7 @@
 #define ARRAY_COUNT(a) (sizeof(a) / sizeof((a)[0]))
 
 #define APP_NAME "Green Curve"
-#define APP_VERSION "0.7"
+#define APP_VERSION "0.10"
 #define CONFIG_FILE_NAME "config.ini"
 #define APP_LINUX_PROBE_FILE "greencurve_linux_probe.md"
 #define APP_LINUX_ASSETS_DIR "linux-artifacts"
@@ -40,8 +40,12 @@ struct FanCurveConfig {
 struct DesiredSettings {
     bool hasCurvePoint[VF_NUM_POINTS];
     unsigned int curvePointMHz[VF_NUM_POINTS];
+    bool hasLock;
+    int lockCi;
+    unsigned int lockMHz;
     bool hasGpuOffset;
     int gpuOffsetMHz;
+    bool gpuOffsetExcludeLow70;
     bool hasMemOffset;
     int memOffsetMHz;
     bool hasPowerLimit;

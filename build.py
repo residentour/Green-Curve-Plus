@@ -4,7 +4,7 @@
 """Build script for Green Curve.
 
 Downloads Zig if needed, generates the app icon, compiles resources,
-then builds ``greencurve.exe``. Linux cross-builds use a separate source set.
+then builds ``Green Curve Plus.exe``. Linux cross-builds use a separate source set.
 """
 
 import argparse
@@ -36,7 +36,7 @@ LINUX_SOURCE_FILES = [
     os.path.join(SOURCE_DIR, "linux_port.cpp"),
     os.path.join(SOURCE_DIR, "linux_tui.cpp"),
 ]
-WINDOWS_OUTPUT_EXE = os.path.join(SCRIPT_DIR, "greencurve.exe")
+WINDOWS_OUTPUT_EXE = os.path.join(SCRIPT_DIR, "Green Curve Plus.exe")
 WINDOWS_TEMP_OUTPUT_EXE = WINDOWS_OUTPUT_EXE + ".new"
 WINDOWS_BACKUP_EXE = WINDOWS_OUTPUT_EXE + ".bak"
 LINUX_TARGET = "x86_64-linux-musl"
@@ -622,25 +622,15 @@ def parse_args():
 def main():
     args = parse_args()
     print("=== Green Curve build ===")
-    try:
-        download_zig()
-        if args.target in ("windows", "all"):
-            compile_windows_binary()
-        if args.target in ("linux", "all"):
-            compile_linux_binary()
-        print("=== Done ===")
-    except SystemExit as e:
-        if e.code != 0:
-            print(f"\n=== Build FAILED (exit code {e.code}) ===")
-        input("\nDevam etmek için Enter'a basın...")
-        raise
-    except Exception as e:
-        print(f"\n=== Beklenmedik hata: {e} ===")
-        input("\nDevam etmek için Enter'a basın...")
-        raise
-    else:
-        input("\nDevam etmek için Enter'a basın...")
+    download_zig()
+    if args.target in ("windows", "all"):
+        compile_windows_binary()
+    if args.target in ("linux", "all"):
+        compile_linux_binary()
+    print("=== Done ===")
 
 
 if __name__ == "__main__":
+    import atexit
+    atexit.register(lambda: input("\nPress Enter to close..."))
     main()

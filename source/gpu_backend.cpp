@@ -1,10 +1,133 @@
+static bool apply_fan_settings(const DesiredSettings* desired, char* failureDetails, size_t failureDetailsSize, int& successCount, int& failCount, char* result, size_t resultSize, bool& outFanChanged) {
+    outFanChanged = false;
+    if (!desired->hasFan) return true;
+
+    auto append_failure = [&](const char* fmt, ...) {
+        char part[256] = {};
+        va_list ap;
+        va_start(ap, fmt);
+        StringCchVPrintfA(part, ARRAY_COUNT(part), fmt, ap);
+        va_end(ap);
+        if (!part[0]) return;
+        if (failureDetails[0]) {
+            StringCchCatA(failureDetails, (int)failureDetailsSize, "; ");
+        }
+        StringCchCatA(failureDetails, (int)failureDetailsSize, part);
+        debug_log("apply failure: %s\n", part);
+    };
+
+    int desiredFanMode = desired->fanMode;
+    if (desiredFanMode < FAN_MODE_AUTO || desiredFanMode > FAN_MODE_CURVE) {
+        desiredFanMode = desired->fanAuto ? FAN_MODE_AUTO : FAN_MODE_FIXED;
+    }
+    FanCurveConfig desiredCurve = desired->fanCurve;
+    fan_curve_normalize(&desiredCurve);
+    if (desiredFanMode == FAN_MODE_CURVE) {
+        char validationErr[256] = {};
+        if (!fan_curve_validate(&desiredCurve, validationErr, sizeof(validationErr))) {
+            set_message(result, resultSize, "%s", validationErr);
+            return false;
+        }
+    }
+
+    bool fanChanged = false;
+    if (!fan_setting_matches_current(desiredFanMode, desired->fanPercent, &desiredCurve)) {
+        fanChanged = true;
+        bool exact = false;
+        char detail[128] = {};
+        bool ok = false;
+        if (desiredFanMode == FAN_MODE_AUTO) {
+            stop_fan_curve_runtime();
+            ok = nvml_set_fan_auto(detail, sizeof(detail));
+            if (ok) {
+                g_app.activeFanMode = FAN_MODE_AUTO;
+            }
+        } else if (desiredFanMode == FAN_MODE_FIXED) {
+            stop_fan_curve_runtime();
+            if (validate_manual_fan_percent_for_runtime(desired->fanPercent, detail, sizeof(detail))) {
+                if (g_app.hMainWnd) {
+                    g_app.activeFanFixedPercent = clamp_percent(desired->fanPercent);
+                    start_fixed_fan_runtime();
+                    ok = g_app.fanFixedRuntimeActive && g_app.fanRuntimeLastApplyTickMs != 0;
+                    if (!ok) {
+                        set_message(detail, sizeof(detail),
+                            g_app.fanRuntimeConsecutiveFailures > 0
+                                ? "Failed to verify the initial fixed fan apply"
+                                : "Failed to start fixed fan maintenance");
+                    }
+                } else {
+                    ok = nvml_set_fan_manual(desired->fanPercent, &exact, detail, sizeof(detail));
+                }
+            }
+            if (ok) {
+                g_app.activeFanMode = FAN_MODE_FIXED;
+                g_app.activeFanFixedPercent = clamp_percent(desired->fanPercent);
+            }
+        } else {
+            copy_fan_curve(&g_app.activeFanCurve, &desiredCurve);
+            if (!validate_fan_curve_for_runtime(&desiredCurve, detail, sizeof(detail))) {
+                ok = false;
+            } else if (g_app.hMainWnd) {
+                start_fan_curve_runtime();
+                ok = g_app.fanCurveRuntimeActive && g_app.fanRuntimeLastApplyTickMs != 0;
+                if (!ok) {
+                    set_message(detail, sizeof(detail),
+                        g_app.fanRuntimeConsecutiveFailures > 0
+                            ? "Failed to verify the initial fan curve apply"
+                            : "Failed to start fan curve maintenance");
+                }
+            } else {
+                set_message(detail, sizeof(detail),
+                    "Fan curve mode requires the resident Green Curve tray app. Start the program hidden to tray for long-running fan control.");
+            }
+        }
+        if (ok) successCount++;
+        else {
+            failCount++;
+            append_failure("Fan control change failed%s%s",
+                detail[0] ? ": " : "",
+                detail[0] ? detail : "");
+        }
+    }
+    outFanChanged = fanChanged;
+    return true;
+}
+
 static bool apply_desired_settings(const DesiredSettings* desired, bool interactive, char* result, size_t resultSize) {
     if (!desired) {
         set_message(result, resultSize, "No desired settings");
         return false;
     }
 
-    DeleteFileA(APP_LOG_FILE);
+    debug_log("apply_desired_settings: hasGpuOffset=%d gpuOffsetMHz=%d gpuOffsetExcludeLow70=%d\n",
+        desired->hasGpuOffset ? 1 : 0, desired->gpuOffsetMHz, desired->gpuOffsetExcludeLow70 ? 1 : 0);
+
+    // When curve points are being written, first reset all current offsets to zero so that
+    // the base frequency (VBIOS default) is exposed cleanly. This prevents stale or clamped
+    // offsets from corrupting the base calculation when switching profiles.
+    if (g_app.vfBackend && g_app.vfBackend->readSupported && g_app.vfBackend->writeSupported) {
+        bool needsCurveReset = false;
+        for (int ci = 0; ci < VF_NUM_POINTS; ci++) {
+            if (desired->hasCurvePoint[ci] && g_app.freqOffsets[ci] != 0) {
+                needsCurveReset = true;
+                break;
+            }
+        }
+        if (needsCurveReset) {
+            int zeroOffsets[VF_NUM_POINTS] = {};
+            bool zeroMask[VF_NUM_POINTS] = {};
+            for (int ci = 0; ci < VF_NUM_POINTS; ci++) {
+                if (g_app.curve[ci].freq_kHz == 0) continue;
+                if (g_app.freqOffsets[ci] != 0) zeroMask[ci] = true;
+            }
+            apply_curve_offsets_verified(zeroOffsets, zeroMask, 2);
+            nvapi_read_curve();
+            nvapi_read_offsets();
+        } else if (g_app.vfBackend->readSupported) {
+            nvapi_read_curve();
+            nvapi_read_offsets();
+        }
+    }
 
     int successCount = 0;
     int failCount = 0;
@@ -22,7 +145,10 @@ static bool apply_desired_settings(const DesiredSettings* desired, bool interact
         StringCchCatA(failureDetails, ARRAY_COUNT(failureDetails), part);
         debug_log("apply failure: %s\n", part);
     };
-    bool hasLock = interactive && g_app.lockedVi >= 0 && g_app.lockedVi < g_app.numVisible;
+    // Only honour the lock that was explicitly captured in the desired settings.
+    // Relying on g_app.lockedVi here caused stale lock state from a previous profile
+    // to leak into apply when the user loaded a new profile (which calls unlock_all).
+    bool hasLock = (desired->hasLock && desired->lockCi >= 0 && desired->lockMHz > 0);
     bool hasCurveEdits = false;
     int lockCi = -1;
     int lockVi = -1;
@@ -32,7 +158,6 @@ static bool apply_desired_settings(const DesiredSettings* desired, bool interact
     int targetMemkHz = 0;
     bool memApplied = false;
     bool powerChanged = false;
-    bool fanChanged = false;
     int currentAppliedGpuOffsetMHz = current_applied_gpu_offset_mhz();
     bool currentActiveGpuOffsetExcludeLow70 = current_applied_gpu_offset_excludes_low_points();
     int targetGpuOffsetkHz = currentAppliedGpuOffsetMHz * 1000;
@@ -41,6 +166,7 @@ static bool apply_desired_settings(const DesiredSettings* desired, bool interact
     bool desiredActiveGpuOffsetExcludeLow70 = false;
     bool gpuPolicyViaCurveBatch = false;
     bool gpuPolicyChangeRequested = false;
+    bool partialApplyRisk = false;
     int originalCurveOffsets[VF_NUM_POINTS] = {};
     int originalCurveFreqkHz[VF_NUM_POINTS] = {};
     bool originalCurvePopulated[VF_NUM_POINTS] = {};
@@ -60,7 +186,10 @@ static bool apply_desired_settings(const DesiredSettings* desired, bool interact
     }
 
     if (hasLock) {
-        if (g_app.lockedCi >= 0 && g_app.lockedCi < VF_NUM_POINTS && g_app.lockedFreq > 0) {
+        if (desired->hasLock && desired->lockCi >= 0 && desired->lockCi < VF_NUM_POINTS && desired->lockMHz > 0) {
+            lockCi = desired->lockCi;
+            lockMhz = desired->lockMHz;
+        } else if (g_app.lockedCi >= 0 && g_app.lockedCi < VF_NUM_POINTS && g_app.lockedFreq > 0) {
             lockCi = g_app.lockedCi;
         } else {
             lockCi = g_app.visibleMap[g_app.lockedVi];
@@ -74,7 +203,9 @@ static bool apply_desired_settings(const DesiredSettings* desired, bool interact
         if (lockVi < 0) {
             hasLock = false;
         } else {
-            lockMhz = desired->hasCurvePoint[lockCi] ? desired->curvePointMHz[lockCi] : get_edit_value(g_app.hEditsMhz[lockVi]);
+            if (lockMhz == 0) {
+                lockMhz = desired->hasCurvePoint[lockCi] ? desired->curvePointMHz[lockCi] : get_edit_value(g_app.hEditsMhz[lockVi]);
+            }
             for (int vi = lockVi; vi < g_app.numVisible; vi++) {
                 int ci = g_app.visibleMap[vi];
                 if (ci >= 0 && ci < VF_NUM_POINTS) lockedTailMask[ci] = true;
@@ -118,11 +249,13 @@ static bool apply_desired_settings(const DesiredSettings* desired, bool interact
 
     if (!gpuOffsetValid) {
         failCount++;
+        partialApplyRisk = true;
         append_failure("GPU offset %d MHz is outside the supported range %d..%d MHz",
             desired->gpuOffsetMHz, g_app.gpuClockOffsetMinMHz, g_app.gpuClockOffsetMaxMHz);
     }
     if (!memOffsetValid) {
         failCount++;
+        partialApplyRisk = true;
         append_failure("Memory offset %d MHz is outside the supported range %d..%d MHz",
             desired->memOffsetMHz, g_app.memClockOffsetMinMHz, g_app.memClockOffsetMaxMHz);
     }
@@ -141,6 +274,7 @@ static bool apply_desired_settings(const DesiredSettings* desired, bool interact
             g_app.appliedGpuOffsetExcludeLow70 = false;
         } else {
             failCount++;
+            partialApplyRisk = true;
             append_failure("GPU offset %d MHz was not accepted by the driver", desired->gpuOffsetMHz);
         }
     }
@@ -151,6 +285,27 @@ static bool apply_desired_settings(const DesiredSettings* desired, bool interact
         for (int ci = 0; ci < VF_NUM_POINTS; ci++) {
             originalCurveOffsets[ci] = g_app.freqOffsets[ci];
             originalCurveFreqkHz[ci] = (int)g_app.curve[ci].freq_kHz;
+        }
+    }
+
+    // When transitioning from a uniform GPU offset to a selective (exclude-low)
+    // offset on Blackwell, zero the existing uniform per-curve-point offsets first.
+    // This establishes a clean baseline (all offsets = 0) so that the selective
+    // per-point deltas are applied from a known state, rather than depending on
+    // correct detection of the previous uniform offset magnitude in the delta formula.
+    if (gpuPolicyViaCurveBatch
+        && !currentActiveGpuOffsetExcludeLow70
+        && currentAppliedGpuOffsetMHz != 0
+        && vf_curve_global_gpu_offset_supported()) {
+        debug_log("selective offset: zeroing prior uniform offset %d MHz before transition\n", currentAppliedGpuOffsetMHz);
+        if (nvapi_set_gpu_offset(0)) {
+            currentAppliedGpuOffsetMHz = 0;
+            for (int ci = 0; ci < VF_NUM_POINTS; ci++) {
+                originalCurveOffsets[ci] = g_app.freqOffsets[ci];
+                originalCurveFreqkHz[ci] = (int)g_app.curve[ci].freq_kHz;
+            }
+        } else {
+            debug_log("selective offset: failed to zero prior uniform offset\n");
         }
     }
 
@@ -166,36 +321,66 @@ static bool apply_desired_settings(const DesiredSettings* desired, bool interact
         }
 
         if (gpuPolicyViaCurveBatch) {
+            bool currentDetected = (currentAppliedGpuOffsetMHz != 0 || currentActiveGpuOffsetExcludeLow70);
+
             for (int ci = 0; ci < VF_NUM_POINTS; ci++) {
                 if (!originalCurvePopulated[ci]) continue;
-                int currentPointGpuOffsetkHz = gpu_offset_component_mhz_for_point(ci, currentAppliedGpuOffsetMHz, currentActiveGpuOffsetExcludeLow70) * 1000;
                 int desiredPointGpuOffsetkHz = gpu_offset_component_mhz_for_point(ci, desired->gpuOffsetMHz, desiredActiveGpuOffsetExcludeLow70) * 1000;
+
+                int currentPointGpuOffsetkHz;
+                if (currentDetected) {
+                    currentPointGpuOffsetkHz = gpu_offset_component_mhz_for_point(ci, currentAppliedGpuOffsetMHz, currentActiveGpuOffsetExcludeLow70) * 1000;
+                } else {
+                    currentPointGpuOffsetkHz = originalCurveOffsets[ci];
+                }
+
                 int targetOffset = clamp_freq_delta_khz(originalCurveOffsets[ci] - currentPointGpuOffsetkHz + desiredPointGpuOffsetkHz);
                 targetCurveOffsets[ci] = targetOffset;
-                if (targetOffset != originalCurveOffsets[ci]) {
-                    targetCurveMask[ci] = true;
-                }
+                targetCurveMask[ci] = true;
             }
-        }
-
-        for (int ci = 0; ci < VF_NUM_POINTS; ci++) {
-            if (!desired->hasCurvePoint[ci]) continue;
-            if (!originalCurvePopulated[ci]) continue;
-            if (hasLock && ci >= lockCi) continue;
-            long long base = (long long)originalCurveFreqkHz[ci] - (long long)originalCurveOffsets[ci];
-            if (base < 0) base = 0;
-            long long target = (long long)desired->curvePointMHz[ci] * 1000LL;
-            targetCurveOffsets[ci] = clamp_freq_delta_khz((int)(target - base));
-            targetCurveMask[ci] = true;
+            debug_log("selective offset: currentMHz=%d desiredMHz=%d currentExcl=%d desiredExcl=%d detected=%d hasLock=%d lockMHz=%d\n",
+                currentAppliedGpuOffsetMHz, desired->gpuOffsetMHz,
+                currentActiveGpuOffsetExcludeLow70 ? 1 : 0,
+                desiredActiveGpuOffsetExcludeLow70 ? 1 : 0,
+                currentDetected ? 1 : 0,
+                hasLock ? 1 : 0, lockMhz);
         }
 
         if (hasLock && lockMhz > 0) {
+            // First apply any explicit (non-tail) curve points from the desired settings
+            for (int ci = 0; ci < VF_NUM_POINTS; ci++) {
+                if (!desired->hasCurvePoint[ci]) continue;
+                if (lockedTailMask[ci]) continue;
+                if (!originalCurvePopulated[ci]) continue;
+                long long base = (long long)originalCurveFreqkHz[ci] - (long long)originalCurveOffsets[ci];
+                if (base < 0) base = 0;
+                long long target = (long long)desired->curvePointMHz[ci] * 1000LL;
+                targetCurveOffsets[ci] = clamp_freq_delta_khz((int)(target - base));
+                targetCurveMask[ci] = true;
+            }
+            // Then apply the lock tail
             for (int ci = 0; ci < VF_NUM_POINTS; ci++) {
                 if (!lockedTailMask[ci]) continue;
                 if (!originalCurvePopulated[ci]) continue;
                 long long base = (long long)originalCurveFreqkHz[ci] - (long long)originalCurveOffsets[ci];
                 if (base < 0) base = 0;
                 long long target = (long long)lockMhz * 1000LL;
+                targetCurveOffsets[ci] = clamp_freq_delta_khz((int)(target - base));
+                targetCurveMask[ci] = true;
+            }
+        } else if (gpuPolicyViaCurveBatch && !hasLock) {
+            // When the selective GPU offset is active without a lock, the explicit
+            // curve point path is skipped because the selective offset already
+            // handles all populated points. The locked tail above also handles
+            // the case where both lock and selective offset are active.
+        } else {
+            // No lock, no selective offset -- explicit curve points only.
+            for (int ci = 0; ci < VF_NUM_POINTS; ci++) {
+                if (!desired->hasCurvePoint[ci]) continue;
+                if (!originalCurvePopulated[ci]) continue;
+                long long base = (long long)originalCurveFreqkHz[ci] - (long long)originalCurveOffsets[ci];
+                if (base < 0) base = 0;
+                long long target = (long long)desired->curvePointMHz[ci] * 1000LL;
                 targetCurveOffsets[ci] = clamp_freq_delta_khz((int)(target - base));
                 targetCurveMask[ci] = true;
             }
@@ -210,6 +395,7 @@ static bool apply_desired_settings(const DesiredSettings* desired, bool interact
                     memApplied = true;
                 } else {
                     failCount++;
+                    partialApplyRisk = true;
                     append_failure("Memory offset %d MHz was not accepted by the driver", desired->memOffsetMHz);
                 }
             }
@@ -219,6 +405,8 @@ static bool apply_desired_settings(const DesiredSettings* desired, bool interact
     bool curveBatchOk = true;
     bool curveBatchNeeded = false;
     bool curveTouched = gpuApplied;
+    int selectiveOffsetApplied = 0;
+    int selectiveOffsetFailed = 0;
     for (int ci = 0; ci < VF_NUM_POINTS; ci++) {
         if (targetCurveMask[ci]) {
             curveBatchNeeded = true;
@@ -228,26 +416,93 @@ static bool apply_desired_settings(const DesiredSettings* desired, bool interact
     if (curveBatchNeeded && (curveRequest || memApplied)) {
         curveTouched = true;
         curveBatchOk = apply_curve_offsets_verified(targetCurveOffsets, targetCurveMask, hasLock ? 3 : 2);
+        // v011: settled read after curve batch for reliable verification
+        bool settledOffsetsOk = false;
+        if (!read_live_curve_snapshot_settled(6, 25, &settledOffsetsOk)) {
+            debug_log("apply curve: settled refresh failed after curve batch\n");
+        }
         char curveVerifyDetail[256] = {};
         bool curveRequestOk = true;
         DesiredSettings verifyDesired = *desired;
 
         if (gpuPolicyViaCurveBatch) {
+            bool currentDetected = (currentAppliedGpuOffsetMHz != 0 || currentActiveGpuOffsetExcludeLow70);
             for (int ci = 0; ci < VF_NUM_POINTS; ci++) {
                 if (!originalCurvePopulated[ci] || verifyDesired.hasCurvePoint[ci]) continue;
 
+                long long currentPointGpuOffsetkHz;
+                if (currentDetected) {
+                    currentPointGpuOffsetkHz = (long long)gpu_offset_component_mhz_for_point(ci, currentAppliedGpuOffsetMHz, currentActiveGpuOffsetExcludeLow70) * 1000LL;
+                } else {
+                    currentPointGpuOffsetkHz = originalCurveOffsets[ci];
+                }
+
                 long long targetFreqkHz = (long long)originalCurveFreqkHz[ci]
-                    - (long long)gpu_offset_component_mhz_for_point(ci, currentAppliedGpuOffsetMHz, currentActiveGpuOffsetExcludeLow70) * 1000LL
+                    - currentPointGpuOffsetkHz
                     + (long long)gpu_offset_component_mhz_for_point(ci, desired->gpuOffsetMHz, desiredActiveGpuOffsetExcludeLow70) * 1000LL;
                 if (targetFreqkHz < 0) targetFreqkHz = 0;
 
                 verifyDesired.hasCurvePoint[ci] = true;
                 verifyDesired.curvePointMHz[ci] = displayed_curve_mhz((unsigned int)targetFreqkHz);
             }
+
+            // Some VF points may have hardware limits that prevent the selective
+            // offset from taking effect (e.g. special max-clock limit points on
+            // Blackwell, or rounding edge cases). Accept the actual live frequency
+            // for points where the hardware didn't apply the expected offset, so the
+            // overall operation isn't marked as failed for a single stubborn point.
+            selectiveOffsetApplied = 0;
+            selectiveOffsetFailed = 0;
+            for (int ci = 0; ci < VF_NUM_POINTS; ci++) {
+                if (!verifyDesired.hasCurvePoint[ci]) continue;
+                if (g_app.curve[ci].freq_kHz == 0) continue;
+                unsigned int actualMHz = displayed_curve_mhz(g_app.curve[ci].freq_kHz);
+                unsigned int targetMHz = verifyDesired.curvePointMHz[ci];
+                int desiredPointOffsetMHz = gpu_offset_component_mhz_for_point(ci, desired->gpuOffsetMHz, desiredActiveGpuOffsetExcludeLow70);
+                int actualOffsetkHz = g_app.freqOffsets[ci];
+                int expectedOffsetkHz = desiredPointOffsetMHz * 1000;
+                if (actualOffsetkHz == expectedOffsetkHz) {
+                    selectiveOffsetApplied++;
+                } else {
+                    selectiveOffsetFailed++;
+                    verifyDesired.curvePointMHz[ci] = actualMHz;
+                    debug_log("selective offset: point %d offset %d kHz != expected %d kHz, accepting actual %u MHz\n",
+                        ci, actualOffsetkHz, expectedOffsetkHz, actualMHz);
+                }
+            }
+            debug_log("selective offset: applied=%d failed=%d\n", selectiveOffsetApplied, selectiveOffsetFailed);
         }
 
         auto verify_curve_request = [&](char* detailOut, size_t detailOutSize) -> bool {
             if (!curveRequest) return true;
+            if (gpuPolicyViaCurveBatch && selectiveOffsetApplied > 0 && selectiveOffsetApplied >= selectiveOffsetFailed) {
+                if (hasLock && lockMhz > 0) {
+                    bool sawTailPoint = false;
+                    for (int ci = 0; ci < VF_NUM_POINTS; ci++) {
+                        if (!lockedTailMask[ci]) continue;
+                        if (g_app.curve[ci].freq_kHz == 0) continue;
+
+                        sawTailPoint = true;
+                        unsigned int actualLockMHz = displayed_curve_mhz(g_app.curve[ci].freq_kHz);
+                        unsigned int toleranceMHz = curve_point_verify_tolerance_mhz(ci);
+                        // lockMhz is the desired absolute frequency; compare directly with actual.
+                        unsigned int deltaMHz = actualLockMHz > lockMhz
+                            ? actualLockMHz - lockMhz : lockMhz - actualLockMHz;
+                        if (deltaMHz > toleranceMHz) {
+                            set_curve_target_mismatch_detail(ci, actualLockMHz, lockMhz, true, detailOut, detailOutSize);
+                            debug_log("selective offset lock tail mismatch: ci=%d actual=%u target=%u tol=%u\n",
+                                ci, actualLockMHz, lockMhz, toleranceMHz);
+                            return false;
+                        }
+                    }
+                    if (!sawTailPoint) {
+                        set_message(detailOut, detailOutSize, "No VF points were available to verify the curve lock");
+                        return false;
+                    }
+                }
+                debug_log("selective offset verified: %d applied, %d failed (accepted)\n", selectiveOffsetApplied, selectiveOffsetFailed);
+                return true;
+            }
             return curve_targets_match_request(&verifyDesired, hasLock ? lockedTailMask : nullptr, lockMhz, detailOut, detailOutSize);
         };
 
@@ -301,9 +556,11 @@ static bool apply_desired_settings(const DesiredSettings* desired, bool interact
                 if (gpuPolicyViaCurveBatch) {
                     g_app.appliedGpuOffsetMHz = desired->gpuOffsetMHz;
                     g_app.appliedGpuOffsetExcludeLow70 = desiredActiveGpuOffsetExcludeLow70;
+                    persist_runtime_selective_gpu_offset_request(desired->gpuOffsetMHz, desiredActiveGpuOffsetExcludeLow70);
                 }
             } else {
                 failCount++;
+                partialApplyRisk = true;
                 if (curveVerifyDetail[0]) {
                     append_failure("%s", curveVerifyDetail);
                 } else if (hasLock && lockMhz > 0) {
@@ -317,17 +574,16 @@ static bool apply_desired_settings(const DesiredSettings* desired, bool interact
         }
         if (memApplied && preserveCurveAcrossMem && !curveRequestOk && !curveRequest) {
             failCount++;
+            partialApplyRisk = true;
             append_failure("Restoring the existing VF curve after the memory offset did not verify");
         }
     }
 
     if (hasLock) {
+        g_app.lockedVi = lockVi;
         g_app.lockedCi = lockCi;
-        if (lockCi >= 0 && lockCi < VF_NUM_POINTS && g_app.curve[lockCi].freq_kHz > 0) {
-            g_app.lockedFreq = displayed_curve_mhz(g_app.curve[lockCi].freq_kHz);
-        } else {
-            g_app.lockedFreq = lockMhz;
-        }
+        g_app.lockedFreq = lockMhz;
+        g_app.guiLockTracksAnchor = desired->lockTracksAnchor;
     }
     if (desired->hasPowerLimit) {
         int currentPowerPct = g_app.powerLimitPct;
@@ -335,87 +591,19 @@ static bool apply_desired_settings(const DesiredSettings* desired, bool interact
             powerChanged = true;
             if (nvapi_set_power_limit(desired->powerLimitPct)) successCount++; else {
                 failCount++;
+                partialApplyRisk = true;
                 append_failure("Power limit %d%% was not accepted by the driver", desired->powerLimitPct);
             }
         }
     }
-    if (desired->hasFan) {
-        int desiredFanMode = desired->fanMode;
-        if (desiredFanMode < FAN_MODE_AUTO || desiredFanMode > FAN_MODE_CURVE) {
-            desiredFanMode = desired->fanAuto ? FAN_MODE_AUTO : FAN_MODE_FIXED;
-        }
-        FanCurveConfig desiredCurve = desired->fanCurve;
-        fan_curve_normalize(&desiredCurve);
-        if (desiredFanMode == FAN_MODE_CURVE) {
-            char validationErr[256] = {};
-            if (!fan_curve_validate(&desiredCurve, validationErr, sizeof(validationErr))) {
-                set_message(result, resultSize, "%s", validationErr);
-                return false;
-            }
-        }
 
-        if (!fan_setting_matches_current(desiredFanMode, desired->fanPercent, &desiredCurve)) {
-            fanChanged = true;
-            bool exact = false;
-            char detail[128] = {};
-            bool ok = false;
-            if (desiredFanMode == FAN_MODE_AUTO) {
-                stop_fan_curve_runtime();
-                ok = nvml_set_fan_auto(detail, sizeof(detail));
-                if (ok) {
-                    g_app.activeFanMode = FAN_MODE_AUTO;
-                    g_app.activeFanFixedPercent = g_app.fanCount ? (int)g_app.fanPercent[0] : 0;
-                }
-            } else if (desiredFanMode == FAN_MODE_FIXED) {
-                stop_fan_curve_runtime();
-                if (!g_app.fanRangeKnown ||
-                    (desired->fanPercent >= (int)g_app.fanMinPct && desired->fanPercent <= (int)g_app.fanMaxPct) ||
-                    desired->fanPercent == 0) {
-                    if (g_app.hMainWnd) {
-                        g_app.activeFanFixedPercent = clamp_percent(desired->fanPercent);
-                        start_fixed_fan_runtime();
-                        ok = g_app.fanFixedRuntimeActive && g_app.fanRuntimeLastApplyTickMs != 0;
-                        if (!ok) {
-                            set_message(detail, sizeof(detail),
-                                g_app.fanRuntimeConsecutiveFailures > 0
-                                    ? "Failed to verify the initial fixed fan apply"
-                                    : "Failed to start fixed fan maintenance");
-                        }
-                    } else {
-                        ok = nvml_set_fan_manual(desired->fanPercent, &exact, detail, sizeof(detail));
-                    }
-                } else {
-                    set_message(detail, sizeof(detail), "Requested %d%% is outside the supported range %u..%u%%",
-                        desired->fanPercent, g_app.fanMinPct, g_app.fanMaxPct);
-                }
-                if (ok) {
-                    g_app.activeFanMode = FAN_MODE_FIXED;
-                    g_app.activeFanFixedPercent = clamp_percent(desired->fanPercent);
-                }
-            } else {
-                copy_fan_curve(&g_app.activeFanCurve, &desiredCurve);
-                if (g_app.hMainWnd) {
-                    start_fan_curve_runtime();
-                    ok = g_app.fanCurveRuntimeActive && g_app.fanRuntimeLastApplyTickMs != 0;
-                    if (!ok) {
-                        set_message(detail, sizeof(detail),
-                            g_app.fanRuntimeConsecutiveFailures > 0
-                                ? "Failed to verify the initial fan curve apply"
-                                : "Failed to start fan curve maintenance");
-                    }
-                } else {
-                    set_message(detail, sizeof(detail),
-                        "Fan curve mode requires the resident Green Curve tray app. Start the program hidden to tray for long-running fan control.");
-                }
-            }
-            if (ok) successCount++;
-            else {
-                failCount++;
-                append_failure("Fan control change failed%s%s",
-                    detail[0] ? ": " : "",
-                    detail[0] ? detail : "");
-            }
-        }
+    bool fanChanged = false;
+    if (!apply_fan_settings(desired, failureDetails, sizeof(failureDetails), successCount, failCount, result, resultSize, fanChanged)) {
+        return false;
+    }
+
+    if (failCount > 0 && successCount > 0) {
+        partialApplyRisk = true;
     }
 
     char detail[128] = {};
@@ -423,9 +611,6 @@ static bool apply_desired_settings(const DesiredSettings* desired, bool interact
         refresh_global_state(detail, sizeof(detail));
     } else if (!curveTouched) {
         detect_clock_offsets();
-    }
-    if (curveTouched) {
-        detect_locked_tail_from_curve();
     }
     populate_global_controls();
     if (interactive) {
@@ -441,14 +626,16 @@ static bool apply_desired_settings(const DesiredSettings* desired, bool interact
         char logErr[256] = {};
         bool logWritten = write_error_report_log("Setting apply reported one or more failures", failureDetails, logErr, sizeof(logErr));
         if (failureDetails[0]) {
-            set_message(result, resultSize, "Applied %d OK, %d failed: %s%s%s",
+            set_message(result, resultSize, "%sApplied %d OK, %d failed: %s%s%s",
+                partialApplyRisk ? "Live state may now be a mixed partial apply. " : "",
                 successCount,
                 failCount,
                 failureDetails,
                 logWritten ? " See " : "",
                 logWritten ? APP_LOG_FILE : "");
         } else {
-            set_message(result, resultSize, "Applied %d OK, %d failed.%s%s",
+            set_message(result, resultSize, "%sApplied %d OK, %d failed.%s%s",
+                partialApplyRisk ? "Live state may now be a mixed partial apply. " : "",
                 successCount,
                 failCount,
                 logWritten ? " See " : "",
@@ -597,8 +784,6 @@ static void read_nvidia_smi_max_clocks() {
             
             if (inMaxSection) {
                 char* vp = nullptr;
-                if ((vp = strstr(line, "Graphics")) && (vp = strchr(vp, ':')))
-                    g_app.smiGpuMaxMHz = (unsigned int)atoi(vp + 1);
                 if ((vp = strstr(line, "Memory")) && (vp = strchr(vp, ':')))
                     g_app.smiMemMaxMHz = (unsigned int)atoi(vp + 1);
             }
@@ -664,13 +849,13 @@ static void detect_clock_offsets() {
     int gpuOffsetkHz = uniform_curve_offset_khz();
     if (gpuOffsetkHz != 0 || g_app.pstateGpuOffsetkHz != 0) {
         if (gpuOffsetkHz == 0) gpuOffsetkHz = g_app.pstateGpuOffsetkHz;
-        g_app.gpuClockOffsetkHz = gpuOffsetkHz;
         if (!g_app.gpuOffsetRangeKnown) {
             int gpuOffsetMHz = gpuOffsetkHz / 1000;
             g_app.gpuClockOffsetMinMHz = gpuOffsetMHz;
             g_app.gpuClockOffsetMaxMHz = gpuOffsetMHz;
         }
     }
+    g_app.gpuClockOffsetkHz = gpuOffsetkHz;
 
     if (g_app.pstateMemMaxMHz > 0 && g_app.smiMemMaxMHz > 0) {
         int memOffsetkHz = ((int)g_app.pstateMemMaxMHz - (int)g_app.smiMemMaxMHz) * 1000;
@@ -766,8 +951,6 @@ static bool nvapi_read_pstates() {
     // Read clock data from public NvAPI Pstates20.
     auto func = (NvApiFunc)nvapi_qi(0x6FF81213u);
     g_app.pstateGpuOffsetkHz = 0;
-    g_app.pstateMemOffsetkHz = 0;
-    g_app.pstateGpuMaxMHz = 0;
     g_app.pstateMemMaxMHz = 0;
     if (!func) return false;
 
@@ -819,8 +1002,6 @@ static bool nvapi_read_pstates() {
                 if (abs(clock->freqDelta_kHz.value) > abs(g_app.pstateGpuOffsetkHz)) {
                     g_app.pstateGpuOffsetkHz = clock->freqDelta_kHz.value;
                 }
-                unsigned int mhz = maxFreq_kHz / 1000;
-                if (mhz > g_app.pstateGpuMaxMHz) g_app.pstateGpuMaxMHz = mhz;
                 if (clock->bIsEditable) {
                     if (pstate->pstateId == NVML_PSTATE_0) {
                         update_curve_range(&curveRangeP0Found, &curveRangeP0MinkHz, &curveRangeP0MaxkHz,
@@ -831,10 +1012,6 @@ static bool nvapi_read_pstates() {
                     }
                 }
             } else if (clock->domainId == NVAPI_GPU_PUBLIC_CLOCK_MEMORY) {
-                int memOffsetkHz = clock->freqDelta_kHz.value;
-                if (abs(memOffsetkHz) > abs(g_app.pstateMemOffsetkHz)) {
-                    g_app.pstateMemOffsetkHz = memOffsetkHz;
-                }
                 unsigned int mhz = maxFreq_kHz / 1000;
                 if (mhz > g_app.pstateMemMaxMHz) g_app.pstateMemMaxMHz = mhz;
             }
@@ -957,7 +1134,9 @@ static bool nvapi_set_power_limit(int pct) {
 static void rebuild_visible_map() {
     g_app.numVisible = 0;
     for (int i = 0; i < VF_NUM_POINTS; i++) {
-        unsigned int freq_mhz = displayed_curve_mhz(g_app.curve[i].freq_kHz);
+        // Keep the editable VF grid stable across applied offsets and curve edits.
+        // Visibility should follow the baseline point position, not the current live target.
+        unsigned int freq_mhz = (unsigned int)(curve_base_khz_for_point(i) / 1000);
         unsigned int volt_mv = g_app.curve[i].volt_uV / 1000;
         if (volt_mv >= MIN_VISIBLE_VOLT_mV && freq_mhz >= MIN_VISIBLE_FREQ_MHz) {
             g_app.visibleMap[g_app.numVisible++] = i;
@@ -965,7 +1144,7 @@ static void rebuild_visible_map() {
     }
 }
 
-static bool restore_locked_tail_from_curve_index(int preferredCi) {
+static bool restore_locked_tail_from_curve_index_exact(int preferredCi) {
     if (preferredCi < 0 || preferredCi >= VF_NUM_POINTS) return false;
     if (g_app.numVisible < 2) return false;
     if (g_app.curve[preferredCi].freq_kHz == 0) return false;
@@ -992,10 +1171,126 @@ static bool restore_locked_tail_from_curve_index(int preferredCi) {
     g_app.lockedVi = preferredVi;
     g_app.lockedCi = preferredCi;
     g_app.lockedFreq = displayed_curve_mhz(lockFreqkHz);
+    g_app.guiLockTracksAnchor = true;
     return true;
 }
 
+static bool restore_locked_tail_from_curve_index_tolerant(int preferredCi, int minTailPoints) {
+    if (preferredCi < 0 || preferredCi >= VF_NUM_POINTS) return false;
+    if (g_app.numVisible < 2) return false;
+    if (g_app.curve[preferredCi].freq_kHz == 0) return false;
+
+    int preferredVi = -1;
+    for (int vi = 0; vi < g_app.numVisible; vi++) {
+        if (g_app.visibleMap[vi] == preferredCi) {
+            preferredVi = vi;
+            break;
+        }
+    }
+    if (preferredVi < 0 || preferredVi >= g_app.numVisible - 1) return false;
+
+    static const int LOCK_TAIL_TOLERANCE_MHZ = 1;
+    unsigned int anchorMHz = displayed_curve_mhz(g_app.curve[preferredCi].freq_kHz);
+    unsigned int summedMHz = anchorMHz;
+    int pointCount = 1;
+    int tailPoints = 0;
+
+    for (int j = preferredVi + 1; j < g_app.numVisible; j++) {
+        int cj = g_app.visibleMap[j];
+        if (g_app.curve[cj].freq_kHz == 0) return false;
+
+        unsigned int pointMHz = displayed_curve_mhz(g_app.curve[cj].freq_kHz);
+        if (abs((int)pointMHz - (int)anchorMHz) > LOCK_TAIL_TOLERANCE_MHZ) return false;
+
+        summedMHz += pointMHz;
+        pointCount++;
+        tailPoints++;
+    }
+
+    if (tailPoints < minTailPoints) return false;
+
+    g_app.lockedVi = preferredVi;
+    g_app.lockedCi = preferredCi;
+    g_app.lockedFreq = (summedMHz + (unsigned int)(pointCount / 2)) / (unsigned int)pointCount;
+    return true;
+}
+
+static bool should_auto_detect_locked_tail_from_live_curve() {
+    // Selective (exclude-low-70) GPU offset creates a uniform tail in the live curve
+    // even without an explicit lock. Suppress auto-detection in that case to prevent
+    // stale lock state leaking into a subsequent profile apply.
+    if (g_app.appliedGpuOffsetExcludeLow70 && g_app.appliedGpuOffsetMHz != 0) {
+        return false;
+    }
+    return true;
+}
+
+static void persist_runtime_selective_gpu_offset_request(int gpuOffsetMHz, bool excludeLow70) {
+    if (!g_app.configPath[0]) return;
+    if (gpuOffsetMHz == 0 || !excludeLow70) {
+        WritePrivateProfileStringA("runtime", "selective_gpu_offset_mhz", nullptr, g_app.configPath);
+        WritePrivateProfileStringA("runtime", "selective_gpu_offset_exclude_low_70", nullptr, g_app.configPath);
+        return;
+    }
+    char buf[32] = {};
+    StringCchPrintfA(buf, ARRAY_COUNT(buf), "%d", gpuOffsetMHz);
+    WritePrivateProfileStringA("runtime", "selective_gpu_offset_mhz", buf, g_app.configPath);
+    WritePrivateProfileStringA("runtime", "selective_gpu_offset_exclude_low_70", excludeLow70 ? "1" : "0", g_app.configPath);
+}
+
+static void set_gui_state_dirty(bool dirty) {
+    g_app.guiStateDirty = dirty;
+}
+
+static bool gui_state_dirty() {
+    return g_app.guiStateDirty;
+}
+
+static bool desired_settings_has_explicit_curve(const DesiredSettings* desired) {
+    if (!desired) return false;
+    for (int i = 0; i < VF_NUM_POINTS; i++) {
+        if (desired->hasCurvePoint[i]) return true;
+    }
+    return false;
+}
+
+static bool selective_gpu_offset_curve_shape_looks_safe(const DesiredSettings* desired, int gpuOffsetMHz, bool excludeLow70) {
+    if (!desired) return false;
+    if (gpuOffsetMHz == 0 || !excludeLow70) return true;
+    if (!desired_settings_has_explicit_curve(desired)) return true;
+
+    bool sawExcludedPoint = false;
+    bool sawIncludedPoint = false;
+    int firstIncludedCi = -1;
+    unsigned int previousMHz = 0;
+    bool havePreviousMHz = false;
+
+    for (int ci = 0; ci < VF_NUM_POINTS; ci++) {
+        if (!desired->hasCurvePoint[ci]) continue;
+        unsigned int mhz = desired->curvePointMHz[ci];
+        if (mhz == 0) continue;
+
+        bool excluded = is_gpu_offset_excluded_low_point(ci, gpuOffsetMHz);
+        if (excluded) {
+            sawExcludedPoint = true;
+            if (firstIncludedCi >= 0) return false;
+        } else {
+            sawIncludedPoint = true;
+            if (firstIncludedCi < 0) firstIncludedCi = ci;
+        }
+
+        if (havePreviousMHz && mhz < previousMHz) return false;
+        previousMHz = mhz;
+        havePreviousMHz = true;
+    }
+
+    if (!sawIncludedPoint) return false;
+    if (!sawExcludedPoint) return true;
+    return firstIncludedCi >= 70;
+}
+
 static void detect_locked_tail_from_curve() {
+    if (!should_auto_detect_locked_tail_from_live_curve()) return;
     int preferredCi = (g_app.lockedFreq > 0 && g_app.lockedCi >= 0 && g_app.lockedCi < VF_NUM_POINTS)
         ? g_app.lockedCi
         : -1;
@@ -1003,9 +1298,13 @@ static void detect_locked_tail_from_curve() {
     g_app.lockedVi = -1;
     g_app.lockedCi = -1;
     g_app.lockedFreq = 0;
+    g_app.guiLockTracksAnchor = true;
 
     if (g_app.numVisible < 2) return;
-    if (preferredCi >= 0 && restore_locked_tail_from_curve_index(preferredCi)) return;
+    if (preferredCi >= 0) {
+        if (restore_locked_tail_from_curve_index_exact(preferredCi)) return;
+        if (restore_locked_tail_from_curve_index_tolerant(preferredCi, 1)) return;
+    }
 
     for (int vi = 0; vi < g_app.numVisible - 1; vi++) {
         int ci = g_app.visibleMap[vi];
@@ -1035,5 +1334,38 @@ static void detect_locked_tail_from_curve() {
             return;
         }
     }
+
+    // Some drivers report a flattened tail with tiny per-point kHz drift even though
+    // the visible curve is effectively locked. Accept a long suffix that stays within
+    // 1 MHz of the anchor so startup detection does not jump to a later voltage point.
+    for (int vi = 0; vi < g_app.numVisible - 1; vi++) {
+        int ci = g_app.visibleMap[vi];
+        if (restore_locked_tail_from_curve_index_tolerant(ci, 3)) {
+            return;
+        }
+    }
+}
+
+static bool read_live_curve_snapshot_settled(int attempts, DWORD delayMs, bool* lastOffsetsOkOut) {
+    if (lastOffsetsOkOut) *lastOffsetsOkOut = false;
+    if (attempts < 1) attempts = 1;
+
+    bool anyCurveOk = false;
+    bool lastOffsetsOk = false;
+    for (int attempt = 0; attempt < attempts; attempt++) {
+        if (attempt > 0 && delayMs > 0) Sleep(delayMs);
+
+        bool curveOk = nvapi_read_curve();
+        bool offsetsOk = nvapi_read_offsets();
+        if (!curveOk) continue;
+
+        anyCurveOk = true;
+        lastOffsetsOk = offsetsOk;
+        rebuild_visible_map();
+        detect_locked_tail_from_curve();
+    }
+
+    if (lastOffsetsOkOut) *lastOffsetsOkOut = lastOffsetsOk;
+    return anyCurveOk;
 }
 

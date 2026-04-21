@@ -30,6 +30,7 @@ int nvmax(int a, int b);
 
 extern int g_dpi;
 extern float g_scale;
+extern CRITICAL_SECTION g_configLock;
 
 int dp(int px);
 void init_dpi();
@@ -51,13 +52,14 @@ void init_dpi();
 #define TRAY_ICON_OC_ID     112
 #define TRAY_ICON_FAN_ID    113
 #define TRAY_ICON_OC_FAN_ID 114
-#define APP_NAME            "Green Curve"
-#define APP_VERSION         "0.8"
+#define APP_NAME            "Green Curve Plus"
+#define APP_VERSION         "0.11m"
 #define APP_TITLE           APP_NAME " v" APP_VERSION
 #define APP_CLASS_NAME      "GreenCurveClass"
 #define APP_EXE_NAME        "greencurve.exe"
 #define APP_LOG_FILE        "greencurve_log.txt"
 #define APP_CLI_LOG_FILE    "greencurve_cli_log.txt"
+#define APP_DEBUG_LOG_FILE  "greencurve_debug.txt"
 #define APP_JSON_FILE       "greencurve_curve.json"
 #define APP_DEBUG_ENV       "GREEN_CURVE_DEBUG"
 #define APP_WM_SYNC_STARTUP (WM_APP + 1)
@@ -66,6 +68,7 @@ void init_dpi();
 #define REFRESH_BTN_ID      2001
 #define RESET_BTN_ID        2003
 #define LICENSE_BTN_ID      2005
+#define GPU_OFFSET_EXCLUDE_LOW_LABEL_ID 2006
 #define PROFILE_COMBO_ID    2020
 #define PROFILE_LOAD_ID     2021
 #define PROFILE_SAVE_ID     2022
@@ -81,6 +84,9 @@ void init_dpi();
 #define FAN_MODE_COMBO_ID   2032
 #define FAN_CURVE_BTN_ID    2033
 #define GPU_OFFSET_EXCLUDE_LOW_CHECK_ID 2034
+#define LOGON_HINT_ID       2035
+#define APPLY_AND_EXIT_CHECK_ID 2037
+#define START_ON_LOGON_LABEL_ID 2036
 #define LOCK_BASE_ID        3000
 #define GPU_OFFSET_ID       2010
 #define MEM_OFFSET_ID       2011
@@ -88,33 +94,36 @@ void init_dpi();
 #define FAN_CONTROL_ID      2013
 #define TRAY_MENU_SHOW_ID   2100
 #define TRAY_MENU_EXIT_ID   2101
-#define TRAY_MENU_APPLY_AND_EXIT_ID        2102
-#define TRAY_MENU_APPLY_AND_EXIT_TIMER_ID  3
-#define APPLY_AND_EXIT_CHECK_ID 2035
-#define LOGON_HINT_ID       2036
 
 #define FAN_CURVE_TIMER_ID  1
+#define FAN_TELEMETRY_TIMER_ID 2
 #define FAN_CURVE_MAX_POINTS 8
 #define FAN_CURVE_MAX_HYSTERESIS_C 10
 
 #define MAX_GPU_FANS        8
 #define CONFIG_FILE_NAME    "config.ini"
 #define STARTUP_TASK_PREFIX "Green Curve Startup - "
-#define CONFIG_NUM_SLOTS    5
+#define CONFIG_NUM_SLOTS    8
 #define CONFIG_DEFAULT_SLOT 1
 #define NVML_PERF_STR_LEN   2048
 
-#define MIN_VISIBLE_VOLT_mV 700
+#define MIN_VISIBLE_VOLT_mV 750
 #define MIN_VISIBLE_FREQ_MHz 500
 
-#define COL_BG              RGB(0x1E, 0x1E, 0x2E)
+#define COL_BG              RGB(0x18, 0x18, 0x28)
+#define COL_PANEL           RGB(0x18, 0x18, 0x28)
+#define COL_INPUT           RGB(0x12, 0x12, 0x1C)
 #define COL_GRID            RGB(0x40, 0x40, 0x55)
 #define COL_AXIS            RGB(0x80, 0x80, 0x90)
-#define COL_CURVE           RGB(0x40, 0xA0, 0xFF)
+#define COL_CURVE           RGB(0x50, 0xD0, 0x80)
 #define COL_POINT           RGB(0xFF, 0x60, 0x60)
-#define COL_POINT_SEL       RGB(0xFF, 0xFF, 0x00)  // selected point: yellow
 #define COL_TEXT            RGB(0xE0, 0xE0, 0xE0)
 #define COL_LABEL           RGB(0xA0, 0xA0, 0xB0)
+#define COL_BUTTON          RGB(0x2B, 0x42, 0x66)
+#define COL_BUTTON_PRESSED  RGB(0x23, 0x36, 0x52)
+#define COL_BUTTON_BORDER   RGB(0x78, 0x9A, 0xD8)
+#define COL_BUTTON_DISABLED RGB(0x2A, 0x2A, 0x38)
+#define COL_POINT_SEL       RGB(0xFF, 0xFF, 0x00)  // selected point: yellow
 
 typedef void* GPU_HANDLE;
 
@@ -394,6 +403,7 @@ struct AppData {
     HWND hLicenseBtn;
     HWND hGpuOffsetEdit;
     HWND hGpuOffsetExcludeLowCheck;
+    HWND hGpuOffsetExcludeLowLabel;
     HWND hMemOffsetEdit;
     HWND hPowerLimitEdit;
     HWND hFanEdit;
@@ -411,6 +421,7 @@ struct AppData {
     HWND hLogonLabel;
     HWND hProfileStatusLabel;
     HWND hStartOnLogonCheck;
+    HWND hStartOnLogonLabel;
     HWND hLogonHintLabel;
     HWND hApplyAndExitCheck;
 
@@ -451,6 +462,7 @@ struct AppData {
     int lockedVi;
     int lockedCi;
     unsigned int lockedFreq;
+    bool guiLockTracksAnchor;
 
     int gpuClockOffsetkHz;
     int memClockOffsetkHz;
@@ -465,8 +477,6 @@ struct AppData {
     bool memOffsetRangeKnown;
     bool curveOffsetRangeKnown;
     int pstateGpuOffsetkHz;
-    int pstateMemOffsetkHz;
-    unsigned int pstateGpuMaxMHz;
     unsigned int pstateMemMaxMHz;
     int powerLimitPct;
     int powerLimitDefaultmW;
@@ -475,7 +485,6 @@ struct AppData {
     int powerLimitMaxmW;
 
     bool smiClocksRead;
-    unsigned int smiGpuMaxMHz;
     unsigned int smiMemMaxMHz;
 
     bool vfInfoCached;
@@ -489,6 +498,7 @@ struct AppData {
     unsigned int fanMinPct;
     unsigned int fanMaxPct;
     unsigned int fanPercent[MAX_GPU_FANS];
+    unsigned int fanTargetPercent[MAX_GPU_FANS];
     unsigned int fanRpm[MAX_GPU_FANS];
     unsigned int fanPolicy[MAX_GPU_FANS];
     unsigned int fanControlSignal[MAX_GPU_FANS];
@@ -497,6 +507,7 @@ struct AppData {
     int gpuTemperatureC;
     bool gpuTemperatureValid;
 
+    bool guiCurvePointExplicit[VF_NUM_POINTS];
     int guiGpuOffsetMHz;
     bool guiGpuOffsetExcludeLow70;
     int appliedGpuOffsetMHz;
@@ -510,6 +521,7 @@ struct AppData {
     int activeFanFixedPercent;
     FanCurveConfig activeFanCurve;
     bool fanCurveRuntimeActive;
+    bool guiStateDirty;
     bool fanFixedRuntimeActive;
     int fanCurveLastAppliedPercent;
     int fanCurveLastAppliedTempC;
@@ -517,23 +529,18 @@ struct AppData {
     unsigned int fanRuntimeConsecutiveFailures;
     ULONGLONG fanRuntimeLastApplyTickMs;
 
-    bool startOnLogon;
     bool launchedFromLogon;
     bool startHiddenToTray;
     bool trayIconAdded;
     int trayIconState;
     HICON trayIcons[4];
     bool trayProfileCacheValid;
-    bool trayProfileCacheHasMode;
-    bool trayProfileCacheCustomOc;
-    bool trayProfileCacheCustomFan;
     bool trayLastRenderedValid;
     int trayLastRenderedState;
-    char trayProfileCacheMode[64];
     char trayProfileCacheProfilePart[64];
     char trayLastRenderedTip[128];
 
-    // Graph interaction state (modifier)
+    // VF graph mouse interaction
     bool graphPointSelected[VF_NUM_POINTS];
     bool graphDragging;
     int  graphDragCi;
@@ -546,6 +553,10 @@ struct AppData {
 struct DesiredSettings {
     bool hasCurvePoint[VF_NUM_POINTS];
     unsigned int curvePointMHz[VF_NUM_POINTS];
+    bool hasLock;
+    int lockCi;
+    unsigned int lockMHz;
+    bool lockTracksAnchor;
     bool hasGpuOffset;
     int gpuOffsetMHz;
     bool gpuOffsetExcludeLow70;

@@ -2,6 +2,12 @@
 // UAC Elevation
 // ============================================================================
 
+static HBRUSH g_hBtnBr = nullptr;
+static HBRUSH g_hInputBr = nullptr;
+static HBRUSH g_hStaticBr = nullptr;
+static HBRUSH g_hListBr = nullptr;
+static HBRUSH g_hEditBr = nullptr;
+
 static bool is_elevated() {
     HANDLE hToken = nullptr;
     if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &hToken))
@@ -118,7 +124,7 @@ static void draw_graph(HDC hdc, RECT* rc) {
     int h = dp(GRAPH_HEIGHT);
 
     // Background
-    HBRUSH bgBrush = CreateSolidBrush(COL_BG);
+    HBRUSH bgBrush = CreateSolidBrush(COL_PANEL);
     RECT graphRc = {0, 0, w, h};
     FillRect(hdc, &graphRc, bgBrush);
     DeleteObject(bgBrush);
@@ -157,12 +163,12 @@ static void draw_graph(HDC hdc, RECT* rc) {
     };
 
     // GDI objects
-    HPEN gridPen = CreatePen(PS_DOT, 1, COL_GRID);
-    HPEN axisPen = CreatePen(PS_SOLID, dp(2), COL_AXIS);
+    HPEN gridPen = CreatePen(PS_SOLID, 1, COL_GRID);
+    HPEN axisPen = CreatePen(PS_SOLID, 1, COL_AXIS);
     HPEN oldPen = (HPEN)SelectObject(hdc, gridPen);
     HFONT hFont = CreateFontA(dp(13), 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET,
         OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_SWISS, "Segoe UI");
-    HFONT hFontSmall = CreateFontA(dp(11), 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET,
+    HFONT hFontSmall = CreateFontA(dp(15), 0, 0, 0, FW_BOLD, 0, 0, 0, DEFAULT_CHARSET,
         OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_SWISS, "Segoe UI");
     HFONT oldFont = (HFONT)SelectObject(hdc, hFont);
     SetBkMode(hdc, TRANSPARENT);
@@ -221,12 +227,25 @@ static void draw_graph(HDC hdc, RECT* rc) {
     // Rotate for Y axis is hard in GDI, place horizontally left of Y labels
     TextOutA(hdc, dp(2), mt - dp(4), yTitle, (int)strlen(yTitle));
 
+    // Mouse interaction hints -- two lines in bottom margin, below X axis labels
+    {
+        SelectObject(hdc, hFontSmall);
+        SetTextColor(hdc, COL_LABEL);
+        const char* hint1 = "CTRL + Mouse: Pick Individual Points";
+        const char* hint2 = "Shift + Mouse: Pick Ranged Points";
+        // Place below the voltage tick labels (dp(4)) and xTitle (dp(24))
+        // mb=55 gives us room at dp(16) and dp(29)
+        int hx = ml + dp(4);
+        TextOutA(hdc, hx, mt + ph + dp(16), hint1, (int)strlen(hint1));
+        TextOutA(hdc, hx, mt + ph + dp(29), hint2, (int)strlen(hint2));
+    }
+
     // Build polyline: sort curve points by voltage, only plot within our ranges
-    // Use preview frequencies during drag
     POINT pts[VF_NUM_POINTS];
+    int   ptsCi[VF_NUM_POINTS];  // curve index for each plotted point
     int nPts = 0;
     for (int i = 0; i < VF_NUM_POINTS; i++) {
-        unsigned int freq_mhz = (g_app.graphDragging && g_app.graphDragPreviewMHz[i] > 0)
+        unsigned int freq_mhz = (g_app.graphDragging && g_app.graphPointSelected[i] && g_app.graphDragPreviewMHz[i] > 0)
             ? (unsigned int)g_app.graphDragPreviewMHz[i]
             : displayed_curve_mhz(g_app.curve[i].freq_kHz);
         unsigned int volt_mv = g_app.curve[i].volt_uV / 1000;
@@ -236,55 +255,47 @@ static void draw_graph(HDC hdc, RECT* rc) {
         if (freq_mhz < (unsigned)MIN_FREQ_MHz || freq_mhz > (unsigned)MAX_FREQ_MHz) continue;
         pts[nPts].x = volt_to_x(volt_mv);
         pts[nPts].y = freq_to_y(freq_mhz);
+        ptsCi[nPts] = i;
         nPts++;
     }
 
     if (nPts > 1) {
-        HPEN curvePen = CreatePen(PS_SOLID, dp(2), COL_CURVE);
-        SelectObject(hdc, curvePen);
-        Polyline(hdc, pts, nPts);
+        draw_curve_polyline_smooth(hdc, pts, nPts, dp(2), COL_CURVE);
         SelectObject(hdc, oldPen);
-        DeleteObject(curvePen);
     }
 
-    // Data points (filled circles) - selected = yellow, others = red
-    HBRUSH ptBrush    = CreateSolidBrush(COL_POINT);
-    HBRUSH ptBrushSel = CreateSolidBrush(COL_POINT_SEL);
-    HPEN   ptPen      = CreatePen(PS_SOLID, 1, COL_POINT);
-    HPEN   ptPenSel   = CreatePen(PS_SOLID, 1, COL_POINT_SEL);
-    HBRUSH oldBrush   = (HBRUSH)SelectObject(hdc, ptBrush);
-
-    int r = dp(5); // slightly larger - easier to click
-
-    // nPts/pts only contains points within the visible range.
-    // Re-apply the same filter to find the real curve index.
+    // Draw regular (unselected) points
     {
-        int visIdx2 = 0;
-        for (int i = 0; i < VF_NUM_POINTS && visIdx2 < nPts; i++) {
-            unsigned int freq_mhz = displayed_curve_mhz(g_app.curve[i].freq_kHz);
-            unsigned int volt_mv  = g_app.curve[i].volt_uV / 1000;
-            if (freq_mhz == 0 && volt_mv == 0) continue;
-            if (volt_mv  < (unsigned)MIN_VOLT_mV  || volt_mv  > (unsigned)MAX_VOLT_mV)  continue;
-            if (freq_mhz < (unsigned)MIN_FREQ_MHz || freq_mhz > (unsigned)MAX_FREQ_MHz) continue;
-            bool sel = g_app.graphPointSelected[i];
-            SelectObject(hdc, sel ? ptBrushSel : ptBrush);
-            SelectObject(hdc, sel ? ptPenSel   : ptPen);
-            Ellipse(hdc, pts[visIdx2].x - r, pts[visIdx2].y - r,
-                         pts[visIdx2].x + r, pts[visIdx2].y + r);
-            visIdx2++;
+        POINT regularPts[VF_NUM_POINTS];
+        int nRegular = 0;
+        for (int i = 0; i < nPts; i++) {
+            if (!g_app.graphPointSelected[ptsCi[i]])
+                regularPts[nRegular++] = pts[i];
         }
+        draw_curve_points_ringed(hdc, regularPts, nRegular, dp(2), dp(4));
+        SelectObject(hdc, oldPen);
     }
 
-    SelectObject(hdc, oldBrush);
-    SelectObject(hdc, oldPen);
-    DeleteObject(ptBrush);
-    DeleteObject(ptBrushSel);
-    DeleteObject(ptPen);
-    DeleteObject(ptPenSel);
+    // Draw selected points in yellow
+    {
+        HBRUSH selBrush = CreateSolidBrush(COL_POINT_SEL);
+        HPEN   selPen   = CreatePen(PS_SOLID, 1, COL_POINT_SEL);
+        HBRUSH oldBr    = (HBRUSH)SelectObject(hdc, selBrush);
+        SelectObject(hdc, selPen);
+        int r = dp(4);
+        for (int i = 0; i < nPts; i++) {
+            if (!g_app.graphPointSelected[ptsCi[i]]) continue;
+            Ellipse(hdc, pts[i].x - r, pts[i].y - r, pts[i].x + r, pts[i].y + r);
+        }
+        SelectObject(hdc, oldBr);
+        SelectObject(hdc, oldPen);
+        DeleteObject(selBrush);
+        DeleteObject(selPen);
+    }
 
     // Frequency labels on curve (every 8 visible points)
     SelectObject(hdc, hFontSmall);
-    SetTextColor(hdc, RGB(0xFF, 0xFF, 0x80));
+    SetTextColor(hdc, COL_TEXT);
     for (int i = 0; i < nPts; i += nvmax(1, nPts / 10)) {
         // Find original curve index for this point
         int visIdx = 0;
@@ -348,13 +359,15 @@ static unsigned int get_edit_value(HWND hEdit) {
 }
 
 static void populate_edits() {
+    memset(g_app.guiCurvePointExplicit, 0, sizeof(g_app.guiCurvePointExplicit));
     for (int vi = 0; vi < g_app.numVisible; vi++) {
         int ci = g_app.visibleMap[vi];
         set_edit_value(g_app.hEditsMhz[vi], displayed_curve_mhz(g_app.curve[ci].freq_kHz));
         set_edit_value(g_app.hEditsMv[vi], g_app.curve[ci].volt_uV / 1000);
         SendMessageA(g_app.hEditsMhz[vi], EM_SETREADONLY, FALSE, 0);
         EnableWindow(g_app.hEditsMhz[vi], TRUE);
-        EnableWindow(g_app.hEditsMv[vi], TRUE);
+        SendMessageA(g_app.hEditsMv[vi], EM_SETREADONLY, TRUE, 0);
+        EnableWindow(g_app.hEditsMv[vi], FALSE);
         SendMessageA(g_app.hLocks[vi], BM_SETCHECK, BST_UNCHECKED, 0);
         EnableWindow(g_app.hLocks[vi], TRUE);
         InvalidateRect(g_app.hLocks[vi], nullptr, FALSE);
@@ -366,6 +379,7 @@ static void populate_edits() {
         for (int j = g_app.lockedVi + 1; j < g_app.numVisible; j++) {
             set_edit_value(g_app.hEditsMhz[j], g_app.lockedFreq);
             SendMessageA(g_app.hEditsMhz[j], EM_SETREADONLY, TRUE, 0);
+            EnableWindow(g_app.hEditsMhz[j], FALSE);
             EnableWindow(g_app.hLocks[j], FALSE);
             InvalidateRect(g_app.hLocks[j], nullptr, FALSE);
         }
@@ -393,6 +407,7 @@ static void apply_lock(int vi) {
     for (int j = vi + 1; j < g_app.numVisible; j++) {
         set_edit_value(g_app.hEditsMhz[j], g_app.lockedFreq);
         SendMessageA(g_app.hEditsMhz[j], EM_SETREADONLY, TRUE, 0);
+        EnableWindow(g_app.hEditsMhz[j], FALSE);
         EnableWindow(g_app.hLocks[j], FALSE);
         InvalidateRect(g_app.hLocks[j], nullptr, FALSE);
     }
@@ -417,9 +432,11 @@ static void unlock_all() {
     g_app.lockedVi = -1;
     g_app.lockedCi = -1;
     g_app.lockedFreq = 0;
+    memset(g_app.guiCurvePointExplicit, 0, sizeof(g_app.guiCurvePointExplicit));
 
     for (int vi = 0; vi < g_app.numVisible; vi++) {
         SendMessageA(g_app.hEditsMhz[vi], EM_SETREADONLY, FALSE, 0);
+        EnableWindow(g_app.hEditsMhz[vi], TRUE);
         int ci = g_app.visibleMap[vi];
         set_edit_value(g_app.hEditsMhz[vi], displayed_curve_mhz(g_app.curve[ci].freq_kHz));
         SendMessageA(g_app.hLocks[vi], BM_SETCHECK, BST_UNCHECKED, 0);
@@ -435,13 +452,13 @@ static void create_edit_controls(HWND hParent, HINSTANCE hInst) {
     int gap = dp(2);
     int rowH = dp(20);
     int headerH = dp(16);
-    // Layout: [#] [cb] [MHz edit] [mV edit]
+    // Layout: [#] [[x]] [MHz edit] [mV edit]
     int colW = labelW + cbW + editW + editW + gap * 3 + dp(8);
     int numCols = 6;
     int rowsPerCol = (g_app.numVisible + numCols - 1) / numCols;
 
     int graphH = dp(GRAPH_HEIGHT);
-    int startY = graphH + dp(14);
+    int startY = graphH + dp(20);
 
     // Column headers
     for (int col = 0; col < numCols; col++) {
@@ -487,17 +504,19 @@ static void create_edit_controls(HWND hParent, HINSTANCE hInst) {
 
         // MHz edit
         g_app.hEditsMhz[vi] = CreateWindowExA(
-            WS_EX_CLIENTEDGE, "EDIT", "0",
+            0, "EDIT", "0",
             WS_CHILD | WS_VISIBLE | ES_NUMBER | ES_RIGHT | ES_AUTOHSCROLL,
             x + labelW + cbW + gap * 2, y, editW, rowH - dp(2),
             hParent, (HMENU)(INT_PTR)(1000 + vi), hInst, nullptr);
 
         // mV edit (read-only)
         g_app.hEditsMv[vi] = CreateWindowExA(
-            WS_EX_CLIENTEDGE, "EDIT", "0",
+            0, "EDIT", "0",
             WS_CHILD | WS_VISIBLE | ES_RIGHT | ES_AUTOHSCROLL | ES_READONLY,
             x + labelW + cbW + gap * 2 + editW + gap, y, editW, rowH - dp(2),
             hParent, (HMENU)(INT_PTR)(1000 + VF_NUM_POINTS + vi), hInst, nullptr);
+        style_input_control(g_app.hEditsMhz[vi]);
+        style_input_control(g_app.hEditsMv[vi]);
     }
 
     // Global control fields below edits
@@ -509,44 +528,43 @@ static void create_edit_controls(HWND hParent, HINSTANCE hInst) {
         dp(8), ocY + dp(2), dp(126), dp(18),
         hParent, nullptr, hInst, nullptr);
     g_app.hGpuOffsetEdit = CreateWindowExA(
-        WS_EX_CLIENTEDGE, "EDIT", "0",
+        0, "EDIT", "0",
         WS_CHILD | WS_VISIBLE | ES_RIGHT | ES_AUTOHSCROLL,
         dp(136), ocY, fieldW, dp(20),
         hParent, (HMENU)(INT_PTR)GPU_OFFSET_ID, hInst, nullptr);
+    style_input_control(g_app.hGpuOffsetEdit);
     g_app.hGpuOffsetExcludeLowCheck = CreateWindowExA(
-        0, "BUTTON", "Exclude from first 70 VF points",
-        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_AUTOCHECKBOX,
-        dp(8), ocY + dp(24), dp(208), dp(18),
+        0, "BUTTON", "",
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
+        dp(8), ocY + dp(24), dp(16), dp(16),
         hParent, (HMENU)(INT_PTR)GPU_OFFSET_EXCLUDE_LOW_CHECK_ID, hInst, nullptr);
-    {
-        typedef HRESULT (WINAPI *SetWindowTheme_t)(HWND, LPCWSTR, LPCWSTR);
-        HMODULE uxtheme = LoadLibraryA("uxtheme.dll");
-        if (uxtheme) {
-            auto pSetWindowTheme = (SetWindowTheme_t)GetProcAddress(uxtheme, "SetWindowTheme");
-            if (pSetWindowTheme) pSetWindowTheme(g_app.hGpuOffsetExcludeLowCheck, L"", L"");
-            FreeLibrary(uxtheme);
-        }
-    }
+    g_app.hGpuOffsetExcludeLowLabel = CreateWindowExA(
+        0, "STATIC", "Exclude from first 70 VF points",
+        WS_CHILD | WS_VISIBLE | SS_LEFT | SS_NOTIFY,
+        dp(28), ocY + dp(23), dp(220), dp(18),
+        hParent, (HMENU)(INT_PTR)GPU_OFFSET_EXCLUDE_LOW_LABEL_ID, hInst, nullptr);
 
     CreateWindowExA(0, "STATIC", "Mem Offset (MHz):",
         WS_CHILD | WS_VISIBLE | SS_LEFT,
         dp(230), ocY + dp(2), dp(126), dp(18),
         hParent, nullptr, hInst, nullptr);
     g_app.hMemOffsetEdit = CreateWindowExA(
-        WS_EX_CLIENTEDGE, "EDIT", "0",
+        0, "EDIT", "0",
         WS_CHILD | WS_VISIBLE | ES_RIGHT | ES_AUTOHSCROLL,
         dp(358), ocY, fieldW, dp(20),
         hParent, (HMENU)(INT_PTR)MEM_OFFSET_ID, hInst, nullptr);
+    style_input_control(g_app.hMemOffsetEdit);
 
     CreateWindowExA(0, "STATIC", "Power Limit (%):",
         WS_CHILD | WS_VISIBLE | SS_LEFT,
         dp(452), ocY + dp(2), dp(100), dp(18),
         hParent, nullptr, hInst, nullptr);
     g_app.hPowerLimitEdit = CreateWindowExA(
-        WS_EX_CLIENTEDGE, "EDIT", "100",
+        0, "EDIT", "100",
         WS_CHILD | WS_VISIBLE | ES_NUMBER | ES_RIGHT | ES_AUTOHSCROLL,
         dp(552), ocY, fieldW, dp(20),
         hParent, (HMENU)(INT_PTR)POWER_LIMIT_ID, hInst, nullptr);
+    style_input_control(g_app.hPowerLimitEdit);
 
     CreateWindowExA(0, "STATIC", "Fan Control:",
         WS_CHILD | WS_VISIBLE | SS_LEFT,
@@ -557,6 +575,7 @@ static void create_edit_controls(HWND hParent, HINSTANCE hInst) {
         WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST,
         dp(738), ocY, dp(136), dp(220),
         hParent, (HMENU)(INT_PTR)FAN_MODE_COMBO_ID, hInst, nullptr);
+    style_combo_control(g_app.hFanModeCombo);
     SendMessageA(g_app.hFanModeCombo, CB_ADDSTRING, 0, (LPARAM)fan_mode_label(FAN_MODE_AUTO));
     SendMessageA(g_app.hFanModeCombo, CB_ADDSTRING, 0, (LPARAM)fan_mode_label(FAN_MODE_FIXED));
     SendMessageA(g_app.hFanModeCombo, CB_ADDSTRING, 0, (LPARAM)fan_mode_label(FAN_MODE_CURVE));
@@ -567,17 +586,23 @@ static void create_edit_controls(HWND hParent, HINSTANCE hInst) {
         dp(882), ocY + dp(2), dp(58), dp(18),
         hParent, nullptr, hInst, nullptr);
     g_app.hFanEdit = CreateWindowExA(
-        WS_EX_CLIENTEDGE, "EDIT", "50",
+        0, "EDIT", "50",
         WS_CHILD | WS_VISIBLE | ES_NUMBER | ES_RIGHT | ES_AUTOHSCROLL,
         dp(942), ocY, dp(56), dp(20),
         hParent, (HMENU)(INT_PTR)FAN_CONTROL_ID, hInst, nullptr);
+    style_input_control(g_app.hFanEdit);
     g_app.hFanCurveBtn = CreateWindowExA(
         0, "BUTTON", "Edit Curve...",
-        WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+        WS_CHILD | WS_VISIBLE | BS_OWNERDRAW,
         dp(1006), ocY - dp(1), dp(160), dp(24),
         hParent, (HMENU)(INT_PTR)FAN_CURVE_BTN_ID, hInst, nullptr);
 
     layout_bottom_buttons(hParent);
+
+    style_combo_control(g_app.hProfileCombo);
+    style_combo_control(g_app.hAppLaunchCombo);
+    style_combo_control(g_app.hLogonCombo);
+    apply_ui_font_to_children(hParent);
 
     if (g_app.loaded) populate_global_controls();
 
@@ -595,6 +620,7 @@ static void apply_changes() {
     DesiredSettings desired = {};
     char err[256] = {};
     if (!capture_gui_apply_settings(&desired, err, sizeof(err))) {
+        write_error_report_log_for_user_failure("GUI apply validation failed", err);
         MessageBoxA(g_app.hMainWnd, err, "Green Curve", MB_OK | MB_ICONERROR);
         return;
     }
@@ -615,6 +641,7 @@ static void destroy_edit_controls(HWND hParent) {
             && id != APP_LAUNCH_COMBO_ID && id != LOGON_COMBO_ID
             && id != PROFILE_LABEL_ID && id != PROFILE_STATE_ID && id != APP_LAUNCH_LABEL_ID
             && id != LOGON_LABEL_ID && id != PROFILE_STATUS_ID && id != START_ON_LOGON_CHECK_ID
+            && id != START_ON_LOGON_LABEL_ID
             && id != APPLY_AND_EXIT_CHECK_ID && id != LOGON_HINT_ID) {
             DestroyWindow(child);
         }
@@ -627,6 +654,7 @@ static void destroy_edit_controls(HWND hParent) {
     }
     g_app.hGpuOffsetEdit = nullptr;
     g_app.hGpuOffsetExcludeLowCheck = nullptr;
+    g_app.hGpuOffsetExcludeLowLabel = nullptr;
     g_app.hMemOffsetEdit = nullptr;
     g_app.hPowerLimitEdit = nullptr;
     g_app.hFanEdit = nullptr;
@@ -637,7 +665,6 @@ static void destroy_edit_controls(HWND hParent) {
 static void refresh_curve() {
     if (nvapi_read_curve() && nvapi_read_offsets()) {
         rebuild_visible_map();
-        detect_locked_tail_from_curve();
         char detail[128] = {};
         refresh_global_state(detail, sizeof(detail));
 
@@ -707,6 +734,7 @@ static void reset_curve() {
     g_app.guiGpuOffsetExcludeLow70 = false;
     g_app.appliedGpuOffsetMHz = 0;
     g_app.appliedGpuOffsetExcludeLow70 = false;
+    memset(g_app.guiCurvePointExplicit, 0, sizeof(g_app.guiCurvePointExplicit));
     g_app.guiFanMode = -1;
     g_app.guiFanFixedPercent = 0;
 
@@ -729,9 +757,22 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         case WM_CREATE:
             create_backbuffer(hwnd);
             apply_system_titlebar_theme(hwnd);
+            allow_dark_mode_for_window(hwnd);
+            update_fan_telemetry_timer();
             ensure_main_window_min_size(hwnd);
             layout_bottom_buttons(hwnd);
             return 0;
+
+        default:
+            if (g_taskbarCreatedMessage != 0 && msg == g_taskbarCreatedMessage) {
+                g_app.trayIconAdded = false;
+                g_app.trayLastRenderedValid = false;
+                if (!IsWindowVisible(hwnd)) {
+                    ensure_tray_icon();
+                }
+                return 0;
+            }
+            break;
 
         case WM_SIZE: {
             if (wParam == SIZE_MINIMIZED) {
@@ -759,6 +800,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         case WM_SETTINGCHANGE:
         case WM_THEMECHANGED:
             apply_system_titlebar_theme(hwnd);
+            allow_dark_mode_for_window(hwnd);
+            refresh_menu_theme_cache();
             break;
 
         case APP_WM_SYNC_STARTUP:
@@ -794,9 +837,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 apply_fan_curve_tick();
                 return 0;
             }
-            if (wParam == TRAY_MENU_APPLY_AND_EXIT_TIMER_ID) {
-                KillTimer(hwnd, TRAY_MENU_APPLY_AND_EXIT_TIMER_ID);
-                DestroyWindow(hwnd);
+            if (wParam == FAN_TELEMETRY_TIMER_ID) {
+                bool redrawControls = window_should_redraw_fan_controls();
+                refresh_live_fan_telemetry(redrawControls);
                 return 0;
             }
             break;
@@ -837,223 +880,65 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 
         case WM_DRAWITEM: {
             const DRAWITEMSTRUCT* dis = (const DRAWITEMSTRUCT*)lParam;
-            if (dis && dis->CtlType == ODT_BUTTON && dis->CtlID >= LOCK_BASE_ID && dis->CtlID < LOCK_BASE_ID + VF_NUM_POINTS) {
-                draw_lock_checkbox(dis);
-                return TRUE;
+            if (dis && dis->CtlType == ODT_BUTTON) {
+                if (dis->CtlID >= LOCK_BASE_ID && dis->CtlID < LOCK_BASE_ID + VF_NUM_POINTS) {
+                    draw_lock_checkbox(dis);
+                    return TRUE;
+                }
+                if (is_themed_button_id(dis->CtlID) || is_themed_checkbox_id(dis->CtlID)) {
+                    draw_themed_button(dis);
+                    return TRUE;
+                }
             }
             return FALSE;
         }
 
-        case WM_COMMAND:
-            if (HIWORD(wParam) == EN_CHANGE && LOWORD(wParam) >= 1000 && LOWORD(wParam) < 1000 + VF_NUM_POINTS) {
-                int vi = LOWORD(wParam) - 1000;
-                if (vi == g_app.lockedVi) {
-                    sync_locked_tail_preview_from_anchor();
-                    return 0;
-                }
-            }
-            if (LOWORD(wParam) == APPLY_BTN_ID) {
-                apply_changes();
-            } else if (LOWORD(wParam) == REFRESH_BTN_ID) {
-                refresh_curve();
-            } else if (LOWORD(wParam) == RESET_BTN_ID) {
-                reset_curve();
-            } else if (LOWORD(wParam) == FAN_MODE_COMBO_ID && HIWORD(wParam) == CBN_SELCHANGE) {
-                int selection = (int)SendMessageA(g_app.hFanModeCombo, CB_GETCURSEL, 0, 0);
-                if (selection >= FAN_MODE_AUTO && selection <= FAN_MODE_CURVE) {
-                    g_app.guiFanMode = selection;
-                    update_fan_controls_enabled_state();
-                }
-            } else if (LOWORD(wParam) == GPU_OFFSET_EXCLUDE_LOW_CHECK_ID && HIWORD(wParam) == BN_CLICKED) {
-                g_app.guiGpuOffsetExcludeLow70 = SendMessageA(g_app.hGpuOffsetExcludeLowCheck, BM_GETCHECK, 0, 0) == BST_CHECKED;
-            } else if (LOWORD(wParam) == FAN_CURVE_BTN_ID && HIWORD(wParam) == BN_CLICKED) {
-                open_fan_curve_dialog();
-            } else if (LOWORD(wParam) == START_ON_LOGON_CHECK_ID && HIWORD(wParam) == BN_CLICKED) {
-                bool enabled = SendMessageA(g_app.hStartOnLogonCheck, BM_GETCHECK, 0, 0) == BST_CHECKED;
-                bool previous = is_start_on_logon_enabled(g_app.configPath);
-                int logonSlot = get_config_int(g_app.configPath, "profiles", "logon_slot", 0);
-                if (logonSlot < 0 || logonSlot > CONFIG_NUM_SLOTS) logonSlot = 0;
-                char err[256] = {};
-                if (!set_start_on_logon_enabled(g_app.configPath, enabled) ||
-                    !set_startup_task_enabled(should_enable_startup_task_from_config(g_app.configPath), err, sizeof(err))) {
-                    set_start_on_logon_enabled(g_app.configPath, previous);
-                    SendMessageA(g_app.hStartOnLogonCheck, BM_SETCHECK, (WPARAM)(previous ? BST_CHECKED : BST_UNCHECKED), 0);
-                    MessageBoxA(g_app.hMainWnd, err[0] ? err : "Failed to update logon startup", "Green Curve", MB_OK | MB_ICONERROR);
-                    break;
-                }
-                refresh_profile_controls_from_config();
-                if (enabled) {
-                    set_profile_status_text(logonSlot > 0
-                        ? "At Windows logon, slot %d will be applied and Green Curve will start hidden in the tray."
-                        : "Green Curve will start hidden in the tray at Windows logon.",
-                        logonSlot);
-                } else {
-                    set_profile_status_text(logonSlot > 0
-                        ? "At Windows logon, slot %d will be applied silently without showing the tray icon."
-                        : "Program start at Windows logon disabled.",
-                        logonSlot);
-                }
-            } else if (LOWORD(wParam) == APPLY_AND_EXIT_CHECK_ID && HIWORD(wParam) == BN_CLICKED) {
-                bool enabled = SendMessageA(g_app.hApplyAndExitCheck, BM_GETCHECK, 0, 0) == BST_CHECKED;
-                set_apply_and_exit_enabled(g_app.configPath, enabled);
-                refresh_profile_controls_from_config();
-                set_profile_status_text(enabled
-                    ? "At logon, profile will be applied then program will exit after 1 second."
-                    : "Apply Profile and Exit disabled.");
-            } else if (LOWORD(wParam) == PROFILE_COMBO_ID && HIWORD(wParam) == CBN_SELCHANGE) {
-                int slot = (int)SendMessageA(g_app.hProfileCombo, CB_GETCURSEL, 0, 0);
-                if (slot < 0) slot = CONFIG_DEFAULT_SLOT - 1;
-                slot += 1;
-                set_config_int(g_app.configPath, "profiles", "selected_slot", slot);
-                update_profile_state_label();
-                update_profile_action_buttons();
-                update_tray_icon();
-                set_profile_status_text("Selected slot %d for save/load actions.", slot);
-            } else if (LOWORD(wParam) == PROFILE_LOAD_ID) {
-                int slot = (int)SendMessageA(g_app.hProfileCombo, CB_GETCURSEL, 0, 0);
-                if (slot < 0) slot = CONFIG_DEFAULT_SLOT - 1;
-                slot += 1;
-                if (!is_profile_slot_saved(g_app.configPath, slot)) {
-                    set_profile_status_text("Slot %d is empty. Save a profile first.", slot);
-                    break;
-                }
-                if (!maybe_confirm_profile_load_replace(slot)) break;
-                DesiredSettings desired = {};
-                char err[256] = {};
-                if (!load_profile_from_config(g_app.configPath, slot, &desired, err, sizeof(err))) {
-                    MessageBoxA(g_app.hMainWnd, err, "Green Curve", MB_OK | MB_ICONERROR);
-                    break;
-                }
-                populate_desired_into_gui(&desired);
-                set_config_int(g_app.configPath, "profiles", "selected_slot", slot);
-                refresh_profile_controls_from_config();
-                set_profile_status_text("Loaded slot %d into the GUI. GPU settings were not applied.", slot);
-                invalidate_main_window();
-            } else if (LOWORD(wParam) == PROFILE_SAVE_ID) {
-                int slot = (int)SendMessageA(g_app.hProfileCombo, CB_GETCURSEL, 0, 0);
-                if (slot < 0) slot = CONFIG_DEFAULT_SLOT - 1;
-                slot += 1;
-                DesiredSettings desired = {};
-                char err[256] = {};
-                if (!capture_gui_config_settings(&desired, err, sizeof(err))) {
-                    MessageBoxA(g_app.hMainWnd, err, "Green Curve", MB_OK | MB_ICONERROR);
-                    break;
-                }
-                if (!save_profile_to_config(g_app.configPath, slot, &desired, err, sizeof(err))) {
-                    MessageBoxA(g_app.hMainWnd, err, "Green Curve", MB_OK | MB_ICONERROR);
-                    break;
-                }
-                refresh_profile_controls_from_config();
-                layout_bottom_buttons(g_app.hMainWnd);
-                set_profile_status_text("Saved the current GUI values to slot %d.", slot);
-                invalidate_main_window();
-            } else if (LOWORD(wParam) == PROFILE_CLEAR_ID) {
-                int slot = (int)SendMessageA(g_app.hProfileCombo, CB_GETCURSEL, 0, 0);
-                if (slot < 0) slot = CONFIG_DEFAULT_SLOT - 1;
-                slot += 1;
-                if (!is_profile_slot_saved(g_app.configPath, slot)) {
-                    set_profile_status_text("Slot %d is already empty.", slot);
-                    break;
-                }
-                char confirm[192];
-                StringCchPrintfA(confirm, ARRAY_COUNT(confirm),
-                    "Clear profile %d? Any app start or logon assignment for this slot will also be disabled.", slot);
-                if (MessageBoxA(g_app.hMainWnd, confirm, "Green Curve", MB_YESNO | MB_ICONQUESTION) != IDYES) break;
-                char err[256] = {};
-                if (!clear_profile_from_config(g_app.configPath, slot, err, sizeof(err))) {
-                    MessageBoxA(g_app.hMainWnd, err, "Green Curve", MB_OK | MB_ICONERROR);
-                    break;
-                }
-                bool taskOk = true;
-                taskOk = set_startup_task_enabled(should_enable_startup_task_from_config(g_app.configPath), err, sizeof(err));
-                if (!taskOk && err[0]) {
-                    MessageBoxA(g_app.hMainWnd, err, "Green Curve", MB_OK | MB_ICONWARNING);
-                }
-                refresh_profile_controls_from_config();
-                layout_bottom_buttons(g_app.hMainWnd);
-                set_profile_status_text("Cleared slot %d and disabled any auto-use for it.", slot);
-                invalidate_main_window();
-            } else if (LOWORD(wParam) == APP_LAUNCH_COMBO_ID || LOWORD(wParam) == LOGON_COMBO_ID) {
-                if (HIWORD(wParam) != CBN_SELCHANGE) break;
-                HWND hCombo = g_app.hAppLaunchCombo;
-                const char* key = "app_launch_slot";
-                if (LOWORD(wParam) == LOGON_COMBO_ID) {
-                    hCombo = g_app.hLogonCombo;
-                    key = "logon_slot";
-                }
-                int sel = (int)SendMessageA(hCombo, CB_GETCURSEL, 0, 0);
-                int slot = (sel < 0) ? 0 : sel;  // index 0 = Disabled (slot 0)
-                if (slot > 0 && !is_profile_slot_saved(g_app.configPath, slot)) {
-                    MessageBoxA(g_app.hMainWnd,
-                        "That slot is empty. Save a profile there before using it for automatic actions.",
-                        "Green Curve", MB_OK | MB_ICONINFORMATION);
-                    refresh_profile_controls_from_config();
-                    break;
-                }
-                if (LOWORD(wParam) == LOGON_COMBO_ID) {
-                    char err[256] = {};
-                    int previousSlot = get_config_int(g_app.configPath, "profiles", key, 0);
-                    if (previousSlot < 0 || previousSlot > CONFIG_NUM_SLOTS) previousSlot = 0;
-                    bool ok = false;
-                    set_config_int(g_app.configPath, "profiles", key, slot);
-                    ok = set_startup_task_enabled(should_enable_startup_task_from_config(g_app.configPath), err, sizeof(err));
-                    if (!ok) {
-                        set_config_int(g_app.configPath, "profiles", key, previousSlot);
-                        MessageBoxA(g_app.hMainWnd, err, "Green Curve", MB_OK | MB_ICONERROR);
-                        refresh_profile_controls_from_config();
-                        break;
-                    }
-                    bool startProgramAtLogon = is_start_on_logon_enabled(g_app.configPath);
-                    set_profile_status_text(slot > 0
-                        ? (startProgramAtLogon
-                            ? "At Windows logon, slot %d will be applied and Green Curve will start hidden in the tray."
-                            : "At Windows logon, slot %d will be applied silently without showing the tray icon.")
-                        : "Windows logon auto-apply disabled.", slot);
-                } else {
-                    set_config_int(g_app.configPath, "profiles", key, slot);
-                    set_profile_status_text(slot > 0
-                        ? "At app start, slot %d will load into the GUI and apply automatically."
-                        : "App start auto-load disabled.", slot);
-                }
-                refresh_profile_controls_from_config();
-                layout_bottom_buttons(g_app.hMainWnd);
-                invalidate_main_window();
-            } else if (LOWORD(wParam) == TRAY_MENU_SHOW_ID) {
-                show_main_window_from_tray();
-            } else if (LOWORD(wParam) == TRAY_MENU_APPLY_AND_EXIT_ID) {
-                if (g_app.loaded) {
-                    DesiredSettings desired = {};
-                    char err[256] = {};
-                    if (capture_gui_apply_settings(&desired, err, sizeof(err))) {
-                        char result[512] = {};
-                        SetCursor(LoadCursor(nullptr, IDC_WAIT));
-                        apply_desired_settings(&desired, false, result, sizeof(result));
-                        SetCursor(LoadCursor(nullptr, IDC_ARROW));
-                    }
-                }
-                SetTimer(hwnd, TRAY_MENU_APPLY_AND_EXIT_TIMER_ID, 1000, nullptr);
-            } else if (LOWORD(wParam) == TRAY_MENU_EXIT_ID) {
-                DestroyWindow(hwnd);
-            } else if (LOWORD(wParam) >= LOCK_BASE_ID && LOWORD(wParam) < LOCK_BASE_ID + VF_NUM_POINTS) {
-                // Lock checkbox clicked
-                int vi = LOWORD(wParam) - LOCK_BASE_ID;
-                if (vi == g_app.lockedVi) {
-                    SendMessageA(g_app.hLocks[vi], BM_SETCHECK, BST_UNCHECKED, 0);
-                    InvalidateRect(g_app.hLocks[vi], nullptr, FALSE);
-                    unlock_all();
-                } else {
-                    SendMessageA(g_app.hLocks[vi], BM_SETCHECK, BST_CHECKED, 0);
-                    InvalidateRect(g_app.hLocks[vi], nullptr, FALSE);
-                    apply_lock(vi);
-                }
-            } else if (LOWORD(wParam) == LICENSE_BTN_ID) {
-                show_license_dialog(g_app.hMainWnd);
-            }
-            return 0;
+        case WM_CTLCOLORBTN: {
+            HDC hdcBtn = (HDC)wParam;
+            SetBkColor(hdcBtn, COL_BG);
+            if (!g_hBtnBr) g_hBtnBr = CreateSolidBrush(COL_BG);
+            return (LRESULT)g_hBtnBr;
+        }
 
-        // ================================================================
-        // Interactive point dragging on graph
-        // ================================================================
+        case WM_CTLCOLORSTATIC: {
+            HDC hdcStatic = (HDC)wParam;
+            HWND hCtl = (HWND)lParam;
+            char className[16] = {};
+            if (hCtl) GetClassNameA(hCtl, className, ARRAY_COUNT(className));
+            LONG_PTR style = hCtl ? GetWindowLongPtrA(hCtl, GWL_STYLE) : 0;
+            bool isEditInput = strcmp(className, "Edit") == 0 &&
+                (((style & ES_READONLY) != 0) || !IsWindowEnabled(hCtl));
+            if (hCtl == g_app.hFanModeCombo || hCtl == g_app.hProfileCombo || hCtl == g_app.hAppLaunchCombo || hCtl == g_app.hLogonCombo || isEditInput) {
+                SetTextColor(hdcStatic, IsWindowEnabled(hCtl) ? COL_TEXT : COL_LABEL);
+                SetBkColor(hdcStatic, COL_INPUT);
+                if (!g_hInputBr) g_hInputBr = CreateSolidBrush(COL_INPUT);
+                return (LRESULT)g_hInputBr;
+            }
+            SetTextColor(hdcStatic, COL_LABEL);
+            SetBkColor(hdcStatic, COL_BG);
+            if (!g_hStaticBr) g_hStaticBr = CreateSolidBrush(COL_BG);
+            return (LRESULT)g_hStaticBr;
+        }
+
+        case WM_CTLCOLORLISTBOX: {
+            HDC hdcList = (HDC)wParam;
+            SetTextColor(hdcList, COL_TEXT);
+            SetBkColor(hdcList, COL_INPUT);
+            if (!g_hListBr) g_hListBr = CreateSolidBrush(COL_INPUT);
+            return (LRESULT)g_hListBr;
+        }
+
+        case WM_CTLCOLOREDIT: {
+            HDC hdcEdit = (HDC)wParam;
+            HWND hCtl = (HWND)lParam;
+            SetTextColor(hdcEdit, (hCtl && IsWindowEnabled(hCtl)) ? COL_TEXT : COL_LABEL);
+            SetBkColor(hdcEdit, COL_INPUT);
+            if (!g_hEditBr) g_hEditBr = CreateSolidBrush(COL_INPUT);
+            return (LRESULT)g_hEditBr;
+        }
+
+
+
         case WM_LBUTTONDOWN: {
             if (!g_app.loaded) break;
             int mx = GET_X_LPARAM(lParam);
@@ -1207,14 +1092,214 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             return 0;
         }
 
-        case WM_SETCURSOR: {
-            // Show SIZENS cursor over graph area (if dragging)
-            if (g_app.graphDragging) {
-                SetCursor(LoadCursor(nullptr, IDC_SIZENS));
-                return TRUE;
+
+        case WM_COMMAND:
+            if (HIWORD(wParam) == EN_CHANGE && LOWORD(wParam) >= 1000 && LOWORD(wParam) < 1000 + VF_NUM_POINTS) {
+                int vi = LOWORD(wParam) - 1000;
+                if (vi == g_app.lockedVi) {
+                    sync_locked_tail_preview_from_anchor();
+                    return 0;
+                }
             }
-            break;
-        }
+            if (LOWORD(wParam) == APPLY_BTN_ID) {
+                apply_changes();
+            } else if (LOWORD(wParam) == REFRESH_BTN_ID) {
+                refresh_curve();
+            } else if (LOWORD(wParam) == RESET_BTN_ID) {
+                reset_curve();
+            } else if (LOWORD(wParam) == FAN_MODE_COMBO_ID && HIWORD(wParam) == CBN_SELCHANGE) {
+                int selection = (int)SendMessageA(g_app.hFanModeCombo, CB_GETCURSEL, 0, 0);
+                if (selection >= FAN_MODE_AUTO && selection <= FAN_MODE_CURVE) {
+                    g_app.guiFanMode = selection;
+                    update_fan_controls_enabled_state();
+                }
+            } else if ((LOWORD(wParam) == GPU_OFFSET_EXCLUDE_LOW_CHECK_ID && HIWORD(wParam) == BN_CLICKED) ||
+                       (LOWORD(wParam) == GPU_OFFSET_EXCLUDE_LOW_LABEL_ID && HIWORD(wParam) == STN_CLICKED)) {
+                g_app.guiGpuOffsetExcludeLow70 = !g_app.guiGpuOffsetExcludeLow70;
+                bool checked = g_app.guiGpuOffsetExcludeLow70;
+                SendMessageA(g_app.hGpuOffsetExcludeLowCheck, BM_SETCHECK, (WPARAM)(checked ? BST_CHECKED : BST_UNCHECKED), 0);
+                InvalidateRect(g_app.hGpuOffsetExcludeLowCheck, nullptr, FALSE);
+            } else if (LOWORD(wParam) == FAN_CURVE_BTN_ID && HIWORD(wParam) == BN_CLICKED) {
+                open_fan_curve_dialog();
+            } else if ((LOWORD(wParam) == START_ON_LOGON_CHECK_ID && HIWORD(wParam) == BN_CLICKED) ||
+                       (LOWORD(wParam) == START_ON_LOGON_LABEL_ID && HIWORD(wParam) == STN_CLICKED)) {
+                bool enabled = !is_start_on_logon_enabled(g_app.configPath);
+                SendMessageA(g_app.hStartOnLogonCheck, BM_SETCHECK, (WPARAM)(enabled ? BST_CHECKED : BST_UNCHECKED), 0);
+                InvalidateRect(g_app.hStartOnLogonCheck, nullptr, FALSE);
+                bool previous = is_start_on_logon_enabled(g_app.configPath);
+                int logonSlot = get_config_int(g_app.configPath, "profiles", "logon_slot", 0);
+                if (logonSlot < 0 || logonSlot > CONFIG_NUM_SLOTS) logonSlot = 0;
+                char err[256] = {};
+                if (!set_start_on_logon_enabled(g_app.configPath, enabled) ||
+                    !set_startup_task_enabled(should_enable_startup_task_from_config(g_app.configPath), err, sizeof(err))) {
+                    set_start_on_logon_enabled(g_app.configPath, previous);
+                    SendMessageA(g_app.hStartOnLogonCheck, BM_SETCHECK, (WPARAM)(previous ? BST_CHECKED : BST_UNCHECKED), 0);
+                    write_error_report_log_for_user_failure("Logon startup update failed", err[0] ? err : "Failed to update logon startup");
+                    MessageBoxA(g_app.hMainWnd, err[0] ? err : "Failed to update logon startup", "Green Curve", MB_OK | MB_ICONERROR);
+                    break;
+                }
+                refresh_profile_controls_from_config();
+                if (enabled) {
+                    set_profile_status_text(logonSlot > 0
+                        ? "At Windows logon, slot %d will be applied and Green Curve will start hidden in the tray."
+                        : "Green Curve will start hidden in the tray at Windows logon.",
+                        logonSlot);
+                } else {
+                    set_profile_status_text(logonSlot > 0
+                        ? "At Windows logon, slot %d will be applied silently without showing the tray icon."
+                        : "Program start at Windows logon disabled.",
+                        logonSlot);
+                }
+            } else if (LOWORD(wParam) == APPLY_AND_EXIT_CHECK_ID && HIWORD(wParam) == BN_CLICKED) {
+                // BS_OWNERDRAW: toggle based on current config state, not BM_GETCHECK
+                bool enabled = !is_apply_and_exit_enabled(g_app.configPath);
+                set_apply_and_exit_enabled(g_app.configPath, enabled);
+                InvalidateRect(g_app.hApplyAndExitCheck, nullptr, FALSE);
+                refresh_profile_controls_from_config();
+                set_profile_status_text(enabled
+                    ? "At logon, profile will be applied then program will exit."
+                    : "Apply Profile and Exit disabled.");
+            } else if (LOWORD(wParam) == PROFILE_COMBO_ID && HIWORD(wParam) == CBN_SELCHANGE) {
+                int slot = (int)SendMessageA(g_app.hProfileCombo, CB_GETCURSEL, 0, 0);
+                if (slot < 0) slot = CONFIG_DEFAULT_SLOT - 1;
+                slot += 1;
+                set_config_int(g_app.configPath, "profiles", "selected_slot", slot);
+                update_profile_state_label();
+                update_profile_action_buttons();
+                update_tray_icon();
+                set_profile_status_text("Selected slot %d for save/load actions.", slot);
+            } else if (LOWORD(wParam) == PROFILE_LOAD_ID) {
+                int slot = (int)SendMessageA(g_app.hProfileCombo, CB_GETCURSEL, 0, 0);
+                if (slot < 0) slot = CONFIG_DEFAULT_SLOT - 1;
+                slot += 1;
+                if (!is_profile_slot_saved(g_app.configPath, slot)) {
+                    set_profile_status_text("Slot %d is empty. Save a profile first.", slot);
+                    break;
+                }
+                if (!maybe_confirm_profile_load_replace(slot)) break;
+                DesiredSettings desired = {};
+                char err[256] = {};
+                if (!load_profile_from_config(g_app.configPath, slot, &desired, err, sizeof(err))) {
+                    write_error_report_log_for_user_failure("Profile load failed", err);
+                    MessageBoxA(g_app.hMainWnd, err, "Green Curve", MB_OK | MB_ICONERROR);
+                    break;
+                }
+                populate_desired_into_gui(&desired);
+                set_config_int(g_app.configPath, "profiles", "selected_slot", slot);
+                refresh_profile_controls_from_config();
+                set_profile_status_text("Loaded slot %d into the GUI. GPU settings were not applied.", slot);
+                invalidate_main_window();
+            } else if (LOWORD(wParam) == PROFILE_SAVE_ID) {
+                int slot = (int)SendMessageA(g_app.hProfileCombo, CB_GETCURSEL, 0, 0);
+                if (slot < 0) slot = CONFIG_DEFAULT_SLOT - 1;
+                slot += 1;
+                DesiredSettings desired = {};
+                char err[256] = {};
+                if (!capture_gui_config_settings(&desired, err, sizeof(err))) {
+                    write_error_report_log_for_user_failure("Profile save capture failed", err);
+                    MessageBoxA(g_app.hMainWnd, err, "Green Curve", MB_OK | MB_ICONERROR);
+                    break;
+                }
+                if (!save_profile_to_config(g_app.configPath, slot, &desired, err, sizeof(err))) {
+                    write_error_report_log_for_user_failure("Profile save failed", err);
+                    MessageBoxA(g_app.hMainWnd, err, "Green Curve", MB_OK | MB_ICONERROR);
+                    break;
+                }
+                refresh_profile_controls_from_config();
+                set_profile_status_text("Saved the current GUI values to slot %d.", slot);
+                invalidate_main_window();
+            } else if (LOWORD(wParam) == PROFILE_CLEAR_ID) {
+                int slot = (int)SendMessageA(g_app.hProfileCombo, CB_GETCURSEL, 0, 0);
+                if (slot < 0) slot = CONFIG_DEFAULT_SLOT - 1;
+                slot += 1;
+                if (!is_profile_slot_saved(g_app.configPath, slot)) {
+                    set_profile_status_text("Slot %d is already empty.", slot);
+                    break;
+                }
+                char confirm[192];
+                StringCchPrintfA(confirm, ARRAY_COUNT(confirm),
+                    "Clear profile %d? Any app start or logon assignment for this slot will also be disabled.", slot);
+                if (MessageBoxA(g_app.hMainWnd, confirm, "Green Curve", MB_YESNO | MB_ICONQUESTION) != IDYES) break;
+                char err[256] = {};
+                if (!clear_profile_from_config(g_app.configPath, slot, err, sizeof(err))) {
+                    write_error_report_log_for_user_failure("Profile clear failed", err);
+                    MessageBoxA(g_app.hMainWnd, err, "Green Curve", MB_OK | MB_ICONERROR);
+                    break;
+                }
+                bool taskOk = true;
+                taskOk = set_startup_task_enabled(should_enable_startup_task_from_config(g_app.configPath), err, sizeof(err));
+                if (!taskOk && err[0]) {
+                    write_error_report_log_for_user_failure("Startup task update failed after profile clear", err);
+                    MessageBoxA(g_app.hMainWnd, err, "Green Curve", MB_OK | MB_ICONWARNING);
+                }
+                refresh_profile_controls_from_config();
+                set_profile_status_text("Cleared slot %d and disabled any auto-use for it.", slot);
+                invalidate_main_window();
+            } else if (LOWORD(wParam) == APP_LAUNCH_COMBO_ID || LOWORD(wParam) == LOGON_COMBO_ID) {
+                if (HIWORD(wParam) != CBN_SELCHANGE) break;
+                HWND hCombo = g_app.hAppLaunchCombo;
+                const char* key = "app_launch_slot";
+                if (LOWORD(wParam) == LOGON_COMBO_ID) {
+                    hCombo = g_app.hLogonCombo;
+                    key = "logon_slot";
+                }
+                int sel = (int)SendMessageA(hCombo, CB_GETCURSEL, 0, 0);
+                int slot = (sel < 0) ? 0 : sel;  // index 0 = Disabled (slot 0)
+                if (slot > 0 && !is_profile_slot_saved(g_app.configPath, slot)) {
+                    MessageBoxA(g_app.hMainWnd,
+                        "That slot is empty. Save a profile there before using it for automatic actions.",
+                        "Green Curve", MB_OK | MB_ICONINFORMATION);
+                    refresh_profile_controls_from_config();
+                    break;
+                }
+                if (LOWORD(wParam) == LOGON_COMBO_ID) {
+                    char err[256] = {};
+                    int previousSlot = get_config_int(g_app.configPath, "profiles", key, 0);
+                    if (previousSlot < 0 || previousSlot > CONFIG_NUM_SLOTS) previousSlot = 0;
+                    bool ok = false;
+                    set_config_int(g_app.configPath, "profiles", key, slot);
+                    ok = set_startup_task_enabled(should_enable_startup_task_from_config(g_app.configPath), err, sizeof(err));
+                    if (!ok) {
+                        set_config_int(g_app.configPath, "profiles", key, previousSlot);
+                        write_error_report_log_for_user_failure("Logon startup task update failed", err);
+                        MessageBoxA(g_app.hMainWnd, err, "Green Curve", MB_OK | MB_ICONERROR);
+                        refresh_profile_controls_from_config();
+                        break;
+                    }
+                    bool startProgramAtLogon = is_start_on_logon_enabled(g_app.configPath);
+                    set_profile_status_text(slot > 0
+                        ? (startProgramAtLogon
+                            ? "At Windows logon, slot %d will be applied and Green Curve will start hidden in the tray."
+                            : "At Windows logon, slot %d will be applied silently without showing the tray icon.")
+                        : "Windows logon auto-apply disabled.", slot);
+                } else {
+                    set_config_int(g_app.configPath, "profiles", key, slot);
+                    set_profile_status_text(slot > 0
+                        ? "At app start, slot %d will load into the GUI and apply automatically."
+                        : "App start auto-load disabled.", slot);
+                }
+                refresh_profile_controls_from_config();
+                invalidate_main_window();
+            } else if (LOWORD(wParam) == TRAY_MENU_SHOW_ID) {
+                show_main_window_from_tray();
+            } else if (LOWORD(wParam) == TRAY_MENU_EXIT_ID) {
+                DestroyWindow(hwnd);
+            } else if (LOWORD(wParam) >= LOCK_BASE_ID && LOWORD(wParam) < LOCK_BASE_ID + VF_NUM_POINTS) {
+                // Lock checkbox clicked
+                int vi = LOWORD(wParam) - LOCK_BASE_ID;
+                if (vi == g_app.lockedVi) {
+                    SendMessageA(g_app.hLocks[vi], BM_SETCHECK, BST_UNCHECKED, 0);
+                    InvalidateRect(g_app.hLocks[vi], nullptr, FALSE);
+                    unlock_all();
+                } else {
+                    SendMessageA(g_app.hLocks[vi], BM_SETCHECK, BST_CHECKED, 0);
+                    InvalidateRect(g_app.hLocks[vi], nullptr, FALSE);
+                    apply_lock(vi);
+                }
+            } else if (LOWORD(wParam) == LICENSE_BTN_ID) {
+                show_license_dialog(g_app.hMainWnd);
+            }
+            return 0;
 
         case WM_GETMINMAXINFO: {
             MINMAXINFO* mmi = (MINMAXINFO*)lParam;
@@ -1226,58 +1311,18 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             return 0;
         }
 
-        case WM_CTLCOLOREDIT: {
-            HDC hdcEdit = (HDC)wParam;
-            SetTextColor(hdcEdit, COL_TEXT);
-            SetBkColor(hdcEdit, RGB(0x1A, 0x1A, 0x2A));
-            static HBRUSH hEditBr = CreateSolidBrush(RGB(0x1A, 0x1A, 0x2A));
-            return (LRESULT)hEditBr;
-        }
-
-        case WM_CTLCOLORBTN: {
-            // Checkboxes with visual styles disabled (SetWindowTheme L"" L"")
-            // send WM_CTLCOLORBTN. Return the window background brush and set
-            // transparent mode so the checkbox renders on the dark background.
-            HDC hdcBtn = (HDC)wParam;
-            HWND hBtn  = (HWND)lParam;
-            if (hBtn == g_app.hStartOnLogonCheck ||
-                hBtn == g_app.hApplyAndExitCheck ||
-                hBtn == g_app.hGpuOffsetExcludeLowCheck) {
-                SetTextColor(hdcBtn, COL_TEXT);
-                SetBkMode(hdcBtn, TRANSPARENT);
-                return (LRESULT)g_app.hWindowClassBrush;
-            }
-            break;
-        }
-
-        case WM_CTLCOLORSTATIC: {
-            HDC hdcStatic = (HDC)wParam;
-            HWND hCtl = (HWND)lParam;
-            if (hCtl == g_app.hProfileCombo || hCtl == g_app.hAppLaunchCombo || hCtl == g_app.hLogonCombo) {
-                SetTextColor(hdcStatic, COL_TEXT);
-                SetBkColor(hdcStatic, RGB(0x1A, 0x1A, 0x2A));
-                static HBRUSH hComboBr = CreateSolidBrush(RGB(0x1A, 0x1A, 0x2A));
-                return (LRESULT)hComboBr;
-            }
-            SetTextColor(hdcStatic, COL_LABEL);
-            SetBkColor(hdcStatic, RGB(0x22, 0x22, 0x32));
-            static HBRUSH hBr = CreateSolidBrush(RGB(0x22, 0x22, 0x32));
-            return (LRESULT)hBr;
-        }
-
-        case WM_CTLCOLORLISTBOX: {
-            HDC hdcList = (HDC)wParam;
-            SetTextColor(hdcList, COL_TEXT);
-            SetBkColor(hdcList, RGB(0x1A, 0x1A, 0x2A));
-            static HBRUSH hListBr = CreateSolidBrush(RGB(0x1A, 0x1A, 0x2A));
-            return (LRESULT)hListBr;
-        }
-
         case WM_DESTROY:
+            KillTimer(hwnd, FAN_TELEMETRY_TIMER_ID);
             stop_fan_curve_runtime(true);
             remove_tray_icon();
             close_startup_sync_thread_handle();
             destroy_backbuffer();
+            if (g_hBtnBr) { DeleteObject(g_hBtnBr); g_hBtnBr = nullptr; }
+            if (g_hInputBr) { DeleteObject(g_hInputBr); g_hInputBr = nullptr; }
+            if (g_hStaticBr) { DeleteObject(g_hStaticBr); g_hStaticBr = nullptr; }
+            if (g_hListBr) { DeleteObject(g_hListBr); g_hListBr = nullptr; }
+            if (g_hEditBr) { DeleteObject(g_hEditBr); g_hEditBr = nullptr; }
+            shutdown_gdiplus();
             PostQuitMessage(0);
             return 0;
     }
