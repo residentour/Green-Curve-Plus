@@ -987,11 +987,9 @@ static void apply_logon_startup_behavior() {
         set_config_int(g_app.configPath, "profiles", "selected_slot", logonSlot);
         refresh_profile_controls_from_config();
 
-        // Apply-and-exit: profile applied, now close the program silently.
-        // Post WM_CLOSE so the message loop gets a chance to run once first.
+        // Apply-and-exit: profile applied successfully.
+        // The caller (entry.cpp) will detect this and exit before the message loop.
         if (applyAndExit) {
-            remove_tray_icon();
-            PostMessageA(g_app.hMainWnd, WM_CLOSE, 0, 0);
             return;
         }
 

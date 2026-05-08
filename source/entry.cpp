@@ -887,9 +887,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE /*hPrev*/, LPSTR /*lpCmdLine*/
 
     bool applyAndExit = g_app.launchedFromLogon && is_apply_and_exit_enabled(g_app.configPath);
     if (applyAndExit) {
-        // Apply-and-exit mode: window stays completely invisible, no tray icon.
-        // apply_logon_startup_behavior() already posted WM_CLOSE.
-        ShowWindow(g_app.hMainWnd, SW_HIDE);
+        // Apply-and-exit mode: apply was done in apply_logon_startup_behavior().
+        // Skip the message loop entirely and return now.
+        remove_tray_icon();
+        DestroyWindow(g_app.hMainWnd);
+        return 0;
     } else if (g_app.startHiddenToTray) {
         // hide_main_window_to_tray() internally calls ensure_tray_icon()
         hide_main_window_to_tray();
