@@ -100,106 +100,64 @@ static long long stable_base_freq_khz(int ci,
                                       const int* originalFreqkHz,
                                       const int* originalOffsets)
 {
-    // Prefer vf_tuple_base: it is the NVAPI-reported static base and is not
-    // affected by thermal-boost transients at cold boot.
-    if (g_app.curve[ci].base_freq_kHz > 0) {
-        return (long long)g_app.curve[ci].base_freq_kHz;
-    }
-    // Fallback: live_freq - applied_offset (pre-reset values).
+    // Base = live frequency minus the offset currently applied to that point.
+    // This is the same definition the verification/correction passes use
+    // (curve_base_khz_for_point), so the first write and the corrections agree.
+    // vf_tuple_base is deliberately NOT used: on Blackwell it can differ from
+    // the real base by ~15 MHz, which put explicit curve points on the wrong
+    // frequency and forced correction passes.
     long long base = (long long)originalFreqkHz[ci] - (long long)originalOffsets[ci];
     if (base < 0) base = 0;
     return base;
 }
 
-static bool apply_desired_settings(const DesiredSettings* desired, bool interactive, char* result, size_t resultSize) {
-    if (!desired) {
+static bool apply_desired_settings(const DesiredSettings* desiredIn, bool interactive, char* result, size_t resultSize) {
+    if (!desiredIn) {
         set_message(result, resultSize, "No desired settings");
         return false;
     }
+    // Local copy: the untouched-neighbor limit below is computed from the FRESH readback
+    // taken at the start of this apply (the GUI's copy of the curve can be stale).
+    DesiredSettings desiredLocal = *desiredIn;
+    const DesiredSettings* desired = &desiredLocal;
 
     debug_log("apply_desired_settings: hasGpuOffset=%d gpuOffsetMHz=%d gpuOffsetExcludeLow70=%d\n",
         desired->hasGpuOffset ? 1 : 0, desired->gpuOffsetMHz, desired->gpuOffsetExcludeLow70 ? 1 : 0);
 
-    // When curve points are being written, first reset all current offsets to zero so that
-    // the base frequency (VBIOS default) is exposed cleanly. This prevents stale or clamped
-    // offsets from corrupting the base calculation when switching profiles.
-    if (g_app.vfBackend && g_app.vfBackend->readSupported && g_app.vfBackend->writeSupported) {
-        bool needsCurveReset = false;
-        for (int ci = 0; ci < VF_NUM_POINTS; ci++) {
-            if (desired->hasCurvePoint[ci] && g_app.freqOffsets[ci] != 0) {
-                needsCurveReset = true;
-                break;
-            }
-        }
-        if (needsCurveReset) {
-            int zeroOffsets[VF_NUM_POINTS] = {};
-            bool zeroMask[VF_NUM_POINTS] = {};
+    // Refresh live state so target offsets are computed from the current base.
+    // NOTE: the previous implementation first wrote ZERO offsets to every VF
+    // point whenever any curve point was being edited. Points that were not
+    // part of the edit (the GUI only sends points whose text changed) were then
+    // never written back, so every "in-between" frequency silently fell back to
+    // stock, and the transient zero-offset curve was what got drawn. Untouched
+    // points now keep their current offsets; only requested points are written.
+    if (g_app.vfBackend && g_app.vfBackend->readSupported) {
+        bool settledOk = false;
+        read_live_curve_snapshot_settled(3, 15, &settledOk);
+        // Cold-boot guard (read-only): right after boot the driver can report a
+        // boosted live frequency. The comparison is made on (live - applied offset)
+        // so an existing overclock offset does not look like a transient.
+        if (settledOk) {
+            bool baseStable = true;
             for (int ci = 0; ci < VF_NUM_POINTS; ci++) {
                 if (g_app.curve[ci].freq_kHz == 0) continue;
-                if (g_app.freqOffsets[ci] != 0) zeroMask[ci] = true;
-            }
-            bool resetOk = apply_curve_offsets_verified(zeroOffsets, zeroMask, 2);
-            // Use settled read after reset so that g_app.curve / g_app.freqOffsets
-            // reflect the stable VBIOS base before we compute new offsets.
-            // We now also read vf_tuple_base (base_freq_kHz) directly from the
-            // GetStatus call; this bypasses the cold-boot thermal boost issue
-            // entirely because vf_tuple_base is the NVAPI VBIOS constant.
-            bool settledOk = false;
-            read_live_curve_snapshot_settled(resetOk ? 4 : 2, 20, &settledOk);
-            if (!resetOk) {
-                nvapi_read_offsets();
-            }
-            // Cold-boot guard: vf_tuple_base lets us detect thermal-boost transients.
-            // If live_freq > base_freq + 50 MHz, the driver hasn't settled yet.
-            // Applies to both interactive (manual Apply) and non-interactive (logon/startup)
-            // applies: a user may manually apply within seconds of a cold boot.
-            if (settledOk) {
-                bool baseStable = true;
-                for (int ci = 0; ci < VF_NUM_POINTS; ci++) {
-                    if (g_app.curve[ci].freq_kHz == 0) continue;
-                    if (g_app.curve[ci].base_freq_kHz == 0) continue;
-                    unsigned int liveMHz = g_app.curve[ci].freq_kHz / 1000;
-                    unsigned int baseMHz = g_app.curve[ci].base_freq_kHz / 1000;
-                    if (liveMHz > baseMHz + 50) {
-                        baseStable = false;
-                        debug_log("cold-boot guard: ci=%d live=%u base=%u -- re-reading\n",
-                            ci, liveMHz, baseMHz);
-                        break;
-                    }
-                }
-                if (!baseStable) {
-                    read_live_curve_snapshot_settled(6, 40, &settledOk);
+                if (g_app.curve[ci].base_freq_kHz == 0) continue;
+                long long liveBasekHz = (long long)g_app.curve[ci].freq_kHz - (long long)g_app.freqOffsets[ci];
+                long long baseMHz = (long long)g_app.curve[ci].base_freq_kHz / 1000;
+                if (liveBasekHz / 1000 > baseMHz + 50) {
+                    baseStable = false;
+                    debug_log("cold-boot guard: ci=%d liveBase=%lld base=%lld -- re-reading\n",
+                        ci, liveBasekHz / 1000, baseMHz);
+                    break;
                 }
             }
-        } else if (g_app.vfBackend->readSupported) {
-            // No reset needed -- just refresh so we have the latest live base.
-            bool settledOk = false;
-            read_live_curve_snapshot_settled(3, 15, &settledOk);
-            // Cold-boot guard for the no-reset path (fresh boot: freqOffsets all zero).
-            // Without a prior reset we still need to wait for thermal-boost to settle
-            // before computing offsets, otherwise the live base is elevated and the
-            // resulting offsets will push the GPU to the wrong frequency.
-            // Applies to both interactive and non-interactive applies.
-            if (settledOk) {
-                bool baseStable = true;
-                for (int ci = 0; ci < VF_NUM_POINTS; ci++) {
-                    if (g_app.curve[ci].freq_kHz == 0) continue;
-                    if (g_app.curve[ci].base_freq_kHz == 0) continue;
-                    unsigned int liveMHz = g_app.curve[ci].freq_kHz / 1000;
-                    unsigned int baseMHz = g_app.curve[ci].base_freq_kHz / 1000;
-                    if (liveMHz > baseMHz + 50) {
-                        baseStable = false;
-                        debug_log("cold-boot guard (no-reset path): ci=%d live=%u base=%u -- re-reading\n",
-                            ci, liveMHz, baseMHz);
-                        break;
-                    }
-                }
-                if (!baseStable) {
-                    read_live_curve_snapshot_settled(6, 40, &settledOk);
-                }
+            if (!baseStable) {
+                read_live_curve_snapshot_settled(6, 40, &settledOk);
             }
         }
     }
+
+    limit_requested_points_to_untouched_neighbors(&desiredLocal, false);
 
     int successCount = 0;
     int failCount = 0;
@@ -239,6 +197,7 @@ static bool apply_desired_settings(const DesiredSettings* desired, bool interact
     bool gpuPolicyViaCurveBatch = false;
     bool gpuPolicyChangeRequested = false;
     bool partialApplyRisk = false;
+    bool curveRolledBack = false;
     int originalCurveOffsets[VF_NUM_POINTS] = {};
     int originalCurveFreqkHz[VF_NUM_POINTS] = {};
     bool originalCurvePopulated[VF_NUM_POINTS] = {};
@@ -268,6 +227,24 @@ static bool apply_desired_settings(const DesiredSettings* desired, bool interact
             originalCurveFreqkHz[ci] = (int)g_app.curve[ci].freq_kHz;
             originalCurvePopulated[ci] = g_app.curve[ci].freq_kHz > 0;
         }
+    }
+
+    // Pre-apply snapshot used to roll the curve back if the requested curve cannot
+    // be verified (ported idea from the 0.29 backend, which refuses to leave the
+    // GPU in a half-applied state).
+    int rollbackCurveOffsets[VF_NUM_POINTS] = {};
+    bool rollbackCurveMask[VF_NUM_POINTS] = {};
+    const int rollbackGpuOffsetkHz = currentAppliedGpuOffsetMHz * 1000;
+    int preFreqkHz[VF_NUM_POINTS] = {};
+    int preOffsetskHz[VF_NUM_POINTS] = {};
+    for (int ci = 0; ci < VF_NUM_POINTS; ci++) {
+        preFreqkHz[ci] = (int)g_app.curve[ci].freq_kHz;
+        preOffsetskHz[ci] = g_app.freqOffsets[ci];
+    }
+    for (int ci = 0; ci < VF_NUM_POINTS; ci++) {
+        if (!originalCurvePopulated[ci]) continue;
+        rollbackCurveOffsets[ci] = originalCurveOffsets[ci];
+        rollbackCurveMask[ci] = true;
     }
 
     if (hasLock) {
@@ -667,6 +644,23 @@ static bool apply_desired_settings(const DesiredSettings* desired, bool interact
                 } else {
                     append_failure("VF curve update did not verify after apply");
                 }
+                // Fail closed: put the curve (and the scalar GPU offset, if this apply
+                // changed it) back to what it was before this apply started.
+                debug_log("apply: curve request failed verification, rolling back to pre-apply offsets\n");
+                bool rollbackOk = true;
+                if (gpuApplied) {
+                    rollbackOk = nvapi_set_gpu_offset(rollbackGpuOffsetkHz) && rollbackOk;
+                    g_app.appliedGpuOffsetMHz = currentAppliedGpuOffsetMHz;
+                }
+                rollbackOk = apply_curve_offsets_verified(rollbackCurveOffsets, rollbackCurveMask, 2) && rollbackOk;
+                bool rbSettled = false;
+                read_live_curve_snapshot_settled(4, 20, &rbSettled);
+                debug_log("apply: rollback %s\n", rollbackOk ? "restored the previous curve" : "did NOT fully restore the previous curve");
+                if (rollbackOk) {
+                    append_failure("The previous curve was restored");
+                    partialApplyRisk = false;
+                    curveRolledBack = true;
+                }
             }
         }
         if (memApplied && preserveCurveAcrossMem && !curveRequestOk && !curveRequest) {
@@ -699,7 +693,7 @@ static bool apply_desired_settings(const DesiredSettings* desired, bool interact
         return false;
     }
 
-    if (failCount > 0 && successCount > 0) {
+    if (failCount > 0 && successCount > 0 && !curveRolledBack) {
         partialApplyRisk = true;
     }
 
@@ -713,6 +707,37 @@ static bool apply_desired_settings(const DesiredSettings* desired, bool interact
     if (interactive) {
         populate_edits();
         invalidate_main_window();
+    }
+
+    // Collateral report: which points that were NOT requested ended up at a different
+    // frequency, and was that an offset write or the driver re-shaping the curve?
+    char collateralNote[240] = {};
+    int requestedPointCount = 0;
+    for (int ci = 0; ci < VF_NUM_POINTS; ci++) if (desired->hasCurvePoint[ci]) requestedPointCount++;
+    if (requestedPointCount > 0) {
+        StringCchPrintfA(collateralNote, ARRAY_COUNT(collateralNote), " Requested curve points: %d.", requestedPointCount);
+    }
+    if (curveRequest) {
+        int movedByClamp = 0, movedByOffset = 0, firstMoved = -1, lastMoved = -1;
+        for (int ci = 0; ci < VF_NUM_POINTS; ci++) {
+            if (preFreqkHz[ci] == 0 || g_app.curve[ci].freq_kHz == 0) continue;
+            if (desired->hasCurvePoint[ci] || (hasLock && lockedTailMask[ci])) continue;
+            int dMHz = ((int)g_app.curve[ci].freq_kHz - preFreqkHz[ci]) / 1000;
+            if (dMHz > -2 && dMHz < 2) continue;
+            if (g_app.freqOffsets[ci] == preOffsetskHz[ci]) movedByClamp++; else movedByOffset++;
+            if (firstMoved < 0) firstMoved = ci;
+            lastMoved = ci;
+            debug_log("collateral: point %d live %d -> %u MHz, offset %d -> %d kHz (%s)\n", ci,
+                preFreqkHz[ci] / 1000, g_app.curve[ci].freq_kHz / 1000, preOffsetskHz[ci], g_app.freqOffsets[ci],
+                g_app.freqOffsets[ci] == preOffsetskHz[ci] ? "offset unchanged = driver re-shaped the curve" : "offset changed");
+        }
+        if (movedByClamp + movedByOffset > 0) {
+            char moved[200] = {};
+            StringCchPrintfA(moved, ARRAY_COUNT(moved),
+                " Note: %d other point(s) (%d..%d) also changed: %d by the driver keeping the curve non-decreasing, %d by offset writes.",
+                movedByClamp + movedByOffset, firstMoved, lastMoved, movedByClamp, movedByOffset);
+            StringCchCatA(collateralNote, ARRAY_COUNT(collateralNote), moved);
+        }
     }
 
     if (successCount == 0 && failCount == 0) {
@@ -741,6 +766,37 @@ static bool apply_desired_settings(const DesiredSettings* desired, bool interact
         if (!logWritten && logErr[0]) {
             debug_log("failed to write error report: %s\n", logErr);
         }
+    }
+    if (collateralNote[0] && result && resultSize > 0) {
+        StringCchCatA(result, resultSize, collateralNote);
+    }
+    if (g_debug_logging && curveRequest) {
+        // Diagnostic: does the driver change anything AFTER the apply returned?
+        for (int ci = 0; ci < VF_NUM_POINTS; ci++) {
+            if (!desired->hasCurvePoint[ci]) continue;
+            for (int cj = (ci > 3 ? ci - 3 : 0); cj <= ci + 3 && cj < VF_NUM_POINTS; cj++) {
+                debug_log("after-apply  point %d%s: freq %d -> %u MHz, offset %d -> %d kHz\n", cj,
+                    desired->hasCurvePoint[cj] ? " (requested)" : "",
+                    preFreqkHz[cj] / 1000, g_app.curve[cj].freq_kHz / 1000, preOffsetskHz[cj], g_app.freqOffsets[cj]);
+            }
+        }
+        Sleep(1500);
+        bool lateOk = false;
+        read_live_curve_snapshot_settled(2, 50, &lateOk);
+        int lateMoved = 0;
+        for (int ci = 0; ci < VF_NUM_POINTS; ci++) {
+            if (preFreqkHz[ci] == 0 || g_app.curve[ci].freq_kHz == 0 || desired->hasCurvePoint[ci]) continue;
+            int dMHz = ((int)g_app.curve[ci].freq_kHz - preFreqkHz[ci]) / 1000;
+            if (dMHz > -2 && dMHz < 2) continue;
+            lateMoved++;
+            debug_log("late-collateral (+1.5 s): point %d live %d -> %u MHz, offset %d -> %d kHz\n", ci,
+                preFreqkHz[ci] / 1000, g_app.curve[ci].freq_kHz / 1000, preOffsetskHz[ci], g_app.freqOffsets[ci]);
+        }
+        debug_log("late-collateral: %d unrequested point(s) differ 1.5 s after apply\n", lateMoved);
+    }
+    if (g_applyClampNote[0] && result && resultSize > 0) {
+        StringCchCatA(result, resultSize, g_applyClampNote);
+        g_applyClampNote[0] = 0;
     }
     return failCount == 0;
 }
@@ -1003,6 +1059,10 @@ static bool nvapi_read_offsets() {
 
 static bool nvapi_set_point(int pointIndex, int freqDelta_kHz) {
     if (pointIndex < 0 || pointIndex >= VF_NUM_POINTS) return false;
+    if (!(g_app.vfMask[pointIndex / 8] & (1u << (pointIndex % 8)))) {
+        debug_log("set_point: point %d not in vfMask, skipping\n", pointIndex);
+        return false;
+    }
     freqDelta_kHz = clamp_freq_delta_khz(freqDelta_kHz);
 
     const VfBackendSpec* backend = g_app.vfBackend;
@@ -1418,44 +1478,12 @@ static void detect_locked_tail_from_curve() {
         if (restore_locked_tail_from_curve_index_tolerant(preferredCi, 1)) return;
     }
 
-    for (int vi = 0; vi < g_app.numVisible - 1; vi++) {
-        int ci = g_app.visibleMap[vi];
-        unsigned int lockFreqkHz = g_app.curve[ci].freq_kHz;
-        if (lockFreqkHz == 0) continue;
-
-        bool hasTail = false;
-        bool allSame = true;
-        for (int j = vi + 1; j < g_app.numVisible; j++) {
-            int cj = g_app.visibleMap[j];
-            unsigned int freqkHz = g_app.curve[cj].freq_kHz;
-            if (freqkHz == 0) {
-                allSame = false;
-                break;
-            }
-            hasTail = true;
-            if (freqkHz != lockFreqkHz) {
-                allSame = false;
-                break;
-            }
-        }
-
-        if (hasTail && allSame) {
-            g_app.lockedVi = vi;
-            g_app.lockedCi = ci;
-            g_app.lockedFreq = displayed_curve_mhz(lockFreqkHz);
-            return;
-        }
-    }
-
-    // Some drivers report a flattened tail with tiny per-point kHz drift even though
-    // the visible curve is effectively locked. Accept a long suffix that stays within
-    // 1 MHz of the anchor so startup detection does not jump to a later voltage point.
-    for (int vi = 0; vi < g_app.numVisible - 1; vi++) {
-        int ci = g_app.visibleMap[vi];
-        if (restore_locked_tail_from_curve_index_tolerant(ci, 3)) {
-            return;
-        }
-    }
+    // A lock is only kept if the user (or a profile) actually set one: it is
+    // re-verified against the live curve above and dropped otherwise.
+    // Previously this function also DISCOVERED a lock whenever the tail of the live
+    // curve happened to be flat (which is normal at the boost ceiling). That made
+    // an unlocked curve look locked at e.g. point 71, so changing point 71 silently
+    // moved every point up to the end of the curve. No discovery any more.
 }
 
 static bool read_live_curve_snapshot_settled(int attempts, DWORD delayMs, bool* lastOffsetsOkOut) {

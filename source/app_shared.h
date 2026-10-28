@@ -53,7 +53,7 @@ void init_dpi();
 #define TRAY_ICON_FAN_ID    113
 #define TRAY_ICON_OC_FAN_ID 114
 #define APP_NAME            "Green Curve Plus"
-#define APP_VERSION         "0.11m"
+#define APP_VERSION         "0.12"
 #define APP_TITLE           APP_NAME " v" APP_VERSION
 #define APP_CLASS_NAME      "GreenCurveClass"
 #define APP_EXE_NAME        "greencurve.exe"
@@ -557,6 +557,14 @@ struct AppData {
     int  graphDragStartFreqMHz[VF_NUM_POINTS];
     int  graphDragPreviewMHz[VF_NUM_POINTS];
     int  graphLastClickCi;
+    // User edits made on the graph that have NOT been applied yet (0 = none).
+    // They live here, never in g_app.curve, which must always mirror the hardware.
+    unsigned int graphPendingMHz[VF_NUM_POINTS];
+    // What each MHz edit box was filled with from the hardware. Apply decides whether the
+    // user changed a point by comparing the box with THIS, not with the live curve, which
+    // drifts a few MHz with temperature/boost and would otherwise make untouched points
+    // look edited (and get written).
+    unsigned int guiEditBaselineMHz[VF_NUM_POINTS];
 };
 
 struct DesiredSettings {

@@ -1,3 +1,20 @@
+// The graph edits must never be written into g_app.curve: that array mirrors the
+// hardware. Faking it made Apply think the edited points were already live (so
+// they were not sent) and the next real readback snapped them back to the old
+// position. Pending edits are kept separately and drawn from here.
+static unsigned int graph_point_display_mhz(int ci) {
+    if (ci < 0 || ci >= VF_NUM_POINTS) return 0;
+    if (g_app.curve[ci].freq_kHz > 0 && g_app.graphPendingMHz[ci] > 0) return g_app.graphPendingMHz[ci];
+    return displayed_curve_mhz(g_app.curve[ci].freq_kHz);
+}
+
+static void graph_set_pending_mhz(int ci, unsigned int mhz) {
+    if (ci < 0 || ci >= VF_NUM_POINTS || g_app.curve[ci].freq_kHz == 0) return;
+    bool differs = mhz > 0 && mhz != displayed_curve_mhz(g_app.curve[ci].freq_kHz);
+    g_app.graphPendingMHz[ci] = differs ? mhz : 0;
+    g_app.guiCurvePointExplicit[ci] = differs;
+}
+
 // ============================================================================
 // UAC Elevation
 // ============================================================================
@@ -245,7 +262,7 @@ static void draw_graph(HDC hdc, RECT* rc) {
     for (int i = 0; i < VF_NUM_POINTS; i++) {
         unsigned int freq_mhz = (g_app.graphDragging && g_app.graphPointSelected[i] && g_app.graphDragPreviewMHz[i] > 0)
             ? (unsigned int)g_app.graphDragPreviewMHz[i]
-            : displayed_curve_mhz(g_app.curve[i].freq_kHz);
+            : graph_point_display_mhz(i);
         unsigned int volt_mv = g_app.curve[i].volt_uV / 1000;
         if (freq_mhz == 0 && volt_mv == 0) continue;
         // Only plot points within our visible range
@@ -358,9 +375,11 @@ static unsigned int get_edit_value(HWND hEdit) {
 
 static void populate_edits() {
     memset(g_app.guiCurvePointExplicit, 0, sizeof(g_app.guiCurvePointExplicit));
+    memset(g_app.graphPendingMHz, 0, sizeof(g_app.graphPendingMHz));
     for (int vi = 0; vi < g_app.numVisible; vi++) {
         int ci = g_app.visibleMap[vi];
         set_edit_value(g_app.hEditsMhz[vi], displayed_curve_mhz(g_app.curve[ci].freq_kHz));
+        g_app.guiEditBaselineMHz[ci] = displayed_curve_mhz(g_app.curve[ci].freq_kHz);
         set_edit_value(g_app.hEditsMv[vi], g_app.curve[ci].volt_uV / 1000);
         SendMessageA(g_app.hEditsMhz[vi], EM_SETREADONLY, FALSE, 0);
         EnableWindow(g_app.hEditsMhz[vi], TRUE);
@@ -431,12 +450,14 @@ static void unlock_all() {
     g_app.lockedCi = -1;
     g_app.lockedFreq = 0;
     memset(g_app.guiCurvePointExplicit, 0, sizeof(g_app.guiCurvePointExplicit));
+    memset(g_app.graphPendingMHz, 0, sizeof(g_app.graphPendingMHz));
 
     for (int vi = 0; vi < g_app.numVisible; vi++) {
         SendMessageA(g_app.hEditsMhz[vi], EM_SETREADONLY, FALSE, 0);
         EnableWindow(g_app.hEditsMhz[vi], TRUE);
         int ci = g_app.visibleMap[vi];
         set_edit_value(g_app.hEditsMhz[vi], displayed_curve_mhz(g_app.curve[ci].freq_kHz));
+        g_app.guiEditBaselineMHz[ci] = displayed_curve_mhz(g_app.curve[ci].freq_kHz);
         SendMessageA(g_app.hLocks[vi], BM_SETCHECK, BST_UNCHECKED, 0);
         EnableWindow(g_app.hLocks[vi], TRUE);
         InvalidateRect(g_app.hLocks[vi], nullptr, FALSE);
@@ -657,40 +678,13 @@ static DWORD WINAPI async_apply_thread(void* param) {
         StringCchPrintfA(result, 512, ok ? "Reset complete." : "Reset had errors. Some settings may not have been restored.");
         PostMessageA(arg->hwnd, APP_WM_ASYNC_DONE, 1, (LPARAM)result);
     } else {
-        // Full pre-reset before every apply -- mirrors the Reset button exactly.
-        // Zeroes curve offsets (2-pass verified), uniform GPU offset, mem offset,
-        // power limit, and fan, so apply_desired_settings always starts from a
-        // clean driver-default state regardless of what was previously active.
-        {
-            // Curve offsets: 2-pass verified zero (same as Reset button)
-            int zeroOffsets[VF_NUM_POINTS] = {};
-            bool resetMask[VF_NUM_POINTS] = {};
-            bool anyCurve = false;
-            for (int ci = 0; ci < VF_NUM_POINTS; ci++) {
-                if (g_app.curve[ci].freq_kHz == 0) continue;
-                resetMask[ci] = true;
-                if (g_app.freqOffsets[ci] != 0) anyCurve = true;
-            }
-            if (anyCurve) {
-                bool ok = apply_curve_offsets_verified(zeroOffsets, resetMask, 2);
-                if (!ok) {
-                    nvapi_read_curve();
-                    nvapi_read_offsets();
-                    apply_curve_offsets_verified(zeroOffsets, resetMask, 2);
-                }
-                // After curve reset, clear the tracked selective-offset state so
-                // apply_desired_settings sees currentDetected=false and computes
-                // targetOffset = 0 + desiredOffset (not 0 - oldOffset + desiredOffset = 0).
-                g_app.appliedGpuOffsetMHz = 0;
-                g_app.appliedGpuOffsetExcludeLow70 = false;
-            }
-            // Uniform GPU clock offset
-            if (g_app.gpuClockOffsetkHz != 0) nvapi_set_gpu_offset(0);
-            // Memory offset
-            if (g_app.memClockOffsetkHz != 0) nvapi_set_mem_offset(0);
-            // Power limit
-            if (g_app.powerLimitPct != 100) nvapi_set_power_limit(100);
-        }
+        // No pre-reset here. This used to zero every curve offset, the GPU/mem offsets and the
+        // power limit before each apply, but the GUI only sends the points/values the user
+        // CHANGED. Everything that was not touched (all other curve points, Mem Offset,
+        // Power Limit) was therefore wiped to stock on every Apply, and the "unchanged"
+        // decision made at capture time no longer matched the hardware. apply_desired_settings
+        // works on deltas from the live state; the Reset button remains the explicit way to
+        // go back to stock.
         apply_desired_settings(&arg->desired, true, result, 512);
         PostMessageA(arg->hwnd, APP_WM_ASYNC_DONE, 0, (LPARAM)result);
     }
@@ -1047,7 +1041,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             int hitDist = INT_MAX;
 
             for (int i = 0; i < VF_NUM_POINTS; i++) {
-                unsigned int freq_mhz = displayed_curve_mhz(g_app.curve[i].freq_kHz);
+                unsigned int freq_mhz = graph_point_display_mhz(i);
                 unsigned int volt_mv  = g_app.curve[i].volt_uV / 1000;
                 if (freq_mhz == 0 && volt_mv == 0) continue;
                 if (volt_mv  < (unsigned)MIN_VOLT_mV  || volt_mv  > (unsigned)MAX_VOLT_mV)  continue;
@@ -1096,7 +1090,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     g_app.graphDragAnchorY = my;
                     // Save starting frequencies and initialise preview array
                     for (int i = 0; i < VF_NUM_POINTS; i++) {
-                        unsigned int freq_mhz = displayed_curve_mhz(g_app.curve[i].freq_kHz);
+                        unsigned int freq_mhz = graph_point_display_mhz(i);
                         g_app.graphDragStartFreqMHz[i] = (int)freq_mhz;
                         g_app.graphDragPreviewMHz[i]   = (int)freq_mhz;
                     }
@@ -1194,8 +1188,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                             int ci2 = g_app.visibleMap[vi2];
                             if (!g_app.graphPointSelected[ci2]) continue;
                             set_edit_value(g_app.hEditsMhz[vi2], anchorMHz);
-                            if (g_app.curve[ci2].freq_kHz > 0)
-                                g_app.curve[ci2].freq_kHz = anchorMHz * 1000u;
+                            graph_set_pending_mhz(ci2, anchorMHz);
                         }
                         invalidate_main_window();
                     }
@@ -1212,8 +1205,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                         if (!g_app.undoPointValid[ci]) continue;
                         unsigned int mhz = g_app.undoEditsMhz[ci];
                         set_edit_value(g_app.hEditsMhz[vi], mhz);
-                        if (g_app.curve[ci].freq_kHz > 0)
-                            g_app.curve[ci].freq_kHz = mhz * 1000u;
+                        graph_set_pending_mhz(ci, mhz);
                     }
                     invalidate_main_window();
                 }
@@ -1233,7 +1225,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                     int ci = g_app.visibleMap[vi];
                     // Save the pre-drag value (before preview was applied)
                     unsigned int preDrag = g_app.curve[ci].freq_kHz > 0
-                        ? g_app.curve[ci].freq_kHz / 1000u : 0;
+                        ? graph_point_display_mhz(ci) : 0;
                     g_app.undoEditsMhz[ci] = preDrag;
                     g_app.undoPointValid[ci] = (preDrag > 0);
                 }
@@ -1243,7 +1235,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
                 if (!g_app.graphPointSelected[i]) continue;
                 if (g_app.graphDragPreviewMHz[i] <= 0) continue;
                 if (g_app.curve[i].freq_kHz == 0) continue;
-                g_app.curve[i].freq_kHz = (unsigned int)g_app.graphDragPreviewMHz[i] * 1000u;
+                graph_set_pending_mhz(i, (unsigned int)g_app.graphDragPreviewMHz[i]);
             }
             g_app.graphDragging = false;
             g_app.graphDragCi   = -1;

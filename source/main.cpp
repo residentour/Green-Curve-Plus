@@ -895,7 +895,13 @@ static bool detect_live_selective_gpu_offset_state(int* gpuOffsetMHzOut) {
 
     for (int candidateIndex = 0; candidateIndex < candidateCount; candidateIndex++) {
         int candidateMHz = candidateOffsets[candidateIndex];
-        int toleranceKHz = TOLERANCE_MHZ * 1000;
+        // The tolerance must stay well below the candidate itself. With a flat 30 MHz a
+        // tiny single-point offset (e.g. 9 MHz) made every 0-offset point "match", and one
+        // edited point was misdetected as a selective GPU offset over the whole curve.
+        int effTolMHz = abs(candidateMHz) / 2;
+        if (effTolMHz > TOLERANCE_MHZ) effTolMHz = TOLERANCE_MHZ;
+        if (effTolMHz < 1) effTolMHz = 1;
+        int toleranceKHz = effTolMHz * 1000;
         bool sawExcludedPoint = false;
         bool sawIncludedPoint = false;
         bool skippedLockedTail = false;
@@ -943,6 +949,7 @@ static bool detect_live_selective_gpu_offset_state(int* gpuOffsetMHzOut) {
         if (sawIncludedPoint) {
             int matchedAverageKHz = includedMatchSumKHz / includedMatchCount;
             int detectedMHz = (matchedAverageKHz >= 0 ? (matchedAverageKHz + 500) : (matchedAverageKHz - 500)) / 1000;
+            if (detectedMHz == 0) continue;  // "selective offset of 0 MHz" is no offset at all
             debug_log("detect_live_selective: found selective offset=%d MHz (candidate=%d MHz, matches=%d/%d, skippedTail=%d)\n",
                 detectedMHz, candidateMHz, includedMatchCount, includedConsideredCount, skippedLockedTail ? 1 : 0);
             if (gpuOffsetMHzOut) *gpuOffsetMHzOut = detectedMHz;
@@ -959,7 +966,10 @@ static bool live_selective_gpu_offset_matches_requested_state(int gpuOffsetMHz) 
     if (!vf_curve_global_gpu_offset_supported() || gpuOffsetMHz == 0) return false;
 
     static const int MATCH_TOLERANCE_MHZ = 12;
-    int toleranceKHz = MATCH_TOLERANCE_MHZ * 1000;
+    int matchTolMHz = abs(gpuOffsetMHz) / 2;
+    if (matchTolMHz > MATCH_TOLERANCE_MHZ) matchTolMHz = MATCH_TOLERANCE_MHZ;
+    if (matchTolMHz < 1) matchTolMHz = 1;
+    int toleranceKHz = matchTolMHz * 1000;
     int targetOffsetKHz = gpuOffsetMHz * 1000;
     bool sawExcludedPoint = false;
     bool sawIncludedPoint = false;
@@ -3271,7 +3281,8 @@ static bool capture_gui_desired_settings(DesiredSettings* desired, bool includeC
         }
         parsedCurveMHz[ci] = mhz;
         parsedCurveHave[ci] = true;
-        if (!captureAllCurvePoints && (!hasLock || vi < g_app.lockedVi) && (unsigned int)mhz != currentMHz) {
+        unsigned int refMHz = g_app.guiEditBaselineMHz[ci] > 0 ? g_app.guiEditBaselineMHz[ci] : currentMHz;
+        if (!captureAllCurvePoints && (!hasLock || vi < g_app.lockedVi) && (unsigned int)mhz != refMHz) {
             anyExplicitCurvePoint = true;
         }
     }
@@ -3318,7 +3329,8 @@ static bool capture_gui_desired_settings(DesiredSettings* desired, bool includeC
         // a profile re-applied after the first apply would see effectiveMHz == currentMHz
         // for all points and produce an empty hasCurvePoint set, causing the async
         // pre-reset to zero offsets without any subsequent curve write.
-        if (captureAllCurvePoints || (unsigned int)effectiveMHz != currentMHz || g_app.guiCurvePointExplicit[ci]) {
+        unsigned int refMHz2 = g_app.guiEditBaselineMHz[ci] > 0 ? g_app.guiEditBaselineMHz[ci] : currentMHz;
+        if (captureAllCurvePoints || (unsigned int)effectiveMHz != refMHz2 || g_app.guiCurvePointExplicit[ci]) {
             desired->hasCurvePoint[ci] = true;
             desired->curvePointMHz[ci] = (unsigned int)effectiveMHz;
         }
@@ -4537,6 +4549,21 @@ static bool nvapi_read_control_table(unsigned char* buf, size_t bufSize) {
     return getFunc(g_app.gpuHandle, buf) == 0;
 }
 
+// A populated VF entry that the driver silently pins at offset 0 no matter what is
+// written (an idle/placeholder point below the operating range). Retrying it can
+// never converge, so it is accepted instead of being retried and reported as a
+// failure. (Ported from the 0.29 backend.)
+static inline bool vf_offset_zero_readback_is_benign(int target, int actual,
+    unsigned int liveKHz, unsigned int operatingMinKHz) {
+    return target > 0 && actual == 0 && liveKHz > 0 && liveKHz < operatingMinKHz;
+}
+
+// Ported from the 0.29 backend: write in batch passes, read the offsets and the
+// curve back after EVERY pass, feed the driver's readback into the next pass's
+// base table, and fall back to single-point writes for whatever did not
+// converge. The old version issued one batch and, when the driver accepted it
+// (ret == 0) but only moved some points, reported failure without retrying --
+// so "in-between" points were left unapplied.
 static bool apply_curve_offsets_verified(const int* targetOffsets, const bool* pointMask, int maxBatchPasses) {
     if (!targetOffsets || !pointMask) return false;
 
@@ -4546,11 +4573,16 @@ static bool apply_curve_offsets_verified(const int* targetOffsets, const bool* p
     bool desiredMask[VF_NUM_POINTS] = {};
     int desiredOffsets[VF_NUM_POINTS] = {};
     bool pendingMask[VF_NUM_POINTS] = {};
+    bool driverRefused[VF_NUM_POINTS] = {};
     int desiredCount = 0;
 
     for (int i = 0; i < VF_NUM_POINTS; i++) {
         if (!pointMask[i]) continue;
         if (g_app.curve[i].freq_kHz == 0) continue;
+        if (!(g_app.vfMask[i / 8] & (1u << (i % 8)))) {
+            debug_log("apply_curve_offsets_verified: point %d not in vfMask, skipping\n", i);
+            continue;
+        }
         desiredMask[i] = true;
         pendingMask[i] = true;
         desiredOffsets[i] = clamp_freq_delta_khz(targetOffsets[i]);
@@ -4565,107 +4597,133 @@ static bool apply_curve_offsets_verified(const int* targetOffsets, const bool* p
 
     unsigned char baseControl[0x4000] = {};
     if (backend->controlBufferSize > sizeof(baseControl)) return false;
-    bool ctrlReadOk = nvapi_read_control_table(baseControl, sizeof(baseControl));
-    if (!ctrlReadOk) {
-        // Control table read failed. For a reset (all targets==0) we can proceed
-        // with a zeroed buffer -- every point will appear as "needs write".
-        // For non-reset writes we also proceed; worst case we write unnecessarily.
-        debug_log("curve write: control table read failed, proceeding with zeroed base\n");
-        memset(baseControl, 0, backend->controlBufferSize);
-        // Set version field if backend knows it
-        if (backend->controlBufferSize >= 4) {
-            unsigned int version = (1u << 16) | backend->controlBufferSize;
-            memcpy(baseControl, &version, sizeof(version));
-        }
+    if (!nvapi_read_control_table(baseControl, sizeof(baseControl))) {
+        debug_log("curve write: control table read failed, aborting before any write\n");
+        return false;
     }
 
     bool anyWrite = false;
     bool batchFailed = false;
+    bool readError = false;   // a readback itself failed (distinct from a rejected batch write)
+    // A single point goes straight to the per-point path (Blackwell requires a
+    // single-bit mask anyway).
+    if (desiredCount <= 1) maxBatchPasses = 0;
 
-    // -- Batch write first, per-point fallback for Blackwell ------------------
-    // Try writing all changed points in one call (fast). If the driver returns
-    // an error (Blackwell requires single-bit mask), fall back to per-point.
-    {
-        // Build batch buffer with all desired changes
-        unsigned char batchBuf[0x4000] = {};
+    unsigned char batchBuf[0x4000];
+    for (int pass = 0; pass < maxBatchPasses; pass++) {
         memcpy(batchBuf, baseControl, backend->controlBufferSize);
-        unsigned char batchWriteMask[32] = {};
-        int pendingCount = 0;
-
+        unsigned char writeMask[32] = {};
+        bool anyPendingWrite = false;
+        int pointsInPass = 0;
         for (int i = 0; i < VF_NUM_POINTS; i++) {
             if (!pendingMask[i]) continue;
             unsigned int deltaOffset = backend->controlEntryBaseOffset
                 + (unsigned int)i * backend->controlEntryStride
                 + backend->controlEntryDeltaOffset;
-            if (deltaOffset + sizeof(desiredOffsets[i]) > backend->controlBufferSize) continue;
-
+            if (deltaOffset + sizeof(int) > backend->controlBufferSize) return false;
             int currentDelta = 0;
-            memcpy(&currentDelta, &baseControl[deltaOffset], sizeof(currentDelta));
+            memcpy(&currentDelta, &batchBuf[deltaOffset], sizeof(currentDelta));
             if (currentDelta == desiredOffsets[i]) { pendingMask[i] = false; continue; }
-
             memcpy(&batchBuf[deltaOffset], &desiredOffsets[i], sizeof(desiredOffsets[i]));
-            batchWriteMask[i / 8] |= (unsigned char)(1u << (i % 8));
-            pendingCount++;
+            writeMask[i / 8] |= (unsigned char)(1u << (i % 8));
+            anyPendingWrite = true;
+            pointsInPass++;
         }
+        if (!anyPendingWrite) break;
 
-        if (pendingCount > 0) {
-            memcpy(&batchBuf[backend->controlMaskOffset], batchWriteMask, sizeof(batchWriteMask));
-            int batchRet = setFunc(g_app.gpuHandle, batchBuf);
-            debug_log("curve batch write: points=%d ret=%d\n", pendingCount, batchRet);
+        memcpy(&batchBuf[backend->controlMaskOffset], writeMask, sizeof(writeMask));
+        int setRet = setFunc(g_app.gpuHandle, batchBuf);
+        debug_log("curve batch pass %d: points=%d ret=%d\n", pass + 1, pointsInPass, setRet);
+        if (setRet != 0) { batchFailed = true; break; }
+        anyWrite = true;
 
-            if (batchRet == 0) {
-                // Batch succeeded (older drivers, Pascal/Turing/Ampere)
-                anyWrite = true;
-                nvapi_read_offsets();
-            } else {
-                // Batch failed -- Blackwell requires single-bit mask per call.
-                // Fall back to per-point writes.
-                debug_log("curve batch failed, falling back to per-point writes\n");
-                int writeCount = 0, failCount = 0;
-                for (int i = 0; i < VF_NUM_POINTS; i++) {
-                    if (!pendingMask[i]) continue;
-                    unsigned int deltaOffset = backend->controlEntryBaseOffset
-                        + (unsigned int)i * backend->controlEntryStride
-                        + backend->controlEntryDeltaOffset;
-                    if (deltaOffset + sizeof(desiredOffsets[i]) > backend->controlBufferSize) {
-                        failCount++; continue;
-                    }
-                    unsigned char pbuf[0x4000] = {};
-                    memcpy(pbuf, baseControl, backend->controlBufferSize);
-                    memset(&pbuf[backend->controlMaskOffset], 0, 32);
-                    pbuf[backend->controlMaskOffset + i / 8] = (unsigned char)(1u << (i % 8));
-                    memcpy(&pbuf[deltaOffset], &desiredOffsets[i], sizeof(desiredOffsets[i]));
-                    int ret = setFunc(g_app.gpuHandle, pbuf);
-                    if (ret == 0) {
-                        writeCount++;
-                        anyWrite = true;
-                        memcpy(&baseControl[deltaOffset], &desiredOffsets[i], sizeof(desiredOffsets[i]));
-                    } else {
-                        failCount++;
-                        batchFailed = true;
-                    }
+        bool readOk = false;
+        for (int tryIdx = 0; tryIdx < 6; tryIdx++) {
+            if (tryIdx > 0) Sleep(10);
+            if (nvapi_read_offsets()) { readOk = true; break; }
+        }
+        if (!readOk) { batchFailed = true; readError = true; break; }
+        if (!nvapi_read_curve()) { batchFailed = true; readError = true; break; }
+
+        bool anyPending = false;
+        for (int i = 0; i < VF_NUM_POINTS; i++) {
+            if (!desiredMask[i]) continue;
+            bool converged = (g_app.freqOffsets[i] == desiredOffsets[i]);
+            if (!converged && vf_offset_zero_readback_is_benign(desiredOffsets[i],
+                    g_app.freqOffsets[i], g_app.curve[i].freq_kHz, MIN_VISIBLE_FREQ_MHz * 1000u)) {
+                if (!driverRefused[i]) {
+                    driverRefused[i] = true;
+                    debug_log("curve offset: driver pins point %d at 0 (wrote %dkHz); accepting as placeholder\n",
+                        i, desiredOffsets[i]);
                 }
-                debug_log("per-point fallback: written=%d failed=%d\n", writeCount, failCount);
-                if (anyWrite) nvapi_read_offsets();
+                pendingMask[i] = false;
+                continue;
             }
+            pendingMask[i] = !converged;
+            if (pendingMask[i]) {
+                anyPending = true;
+                debug_log("curve batch pass %d unconverged: ci=%d wrote=%dkHz readback=%dkHz\n",
+                    pass + 1, i, desiredOffsets[i], g_app.freqOffsets[i]);
+            }
+            // The next pass starts from what the driver actually holds.
+            unsigned int deltaOffset = backend->controlEntryBaseOffset
+                + (unsigned int)i * backend->controlEntryStride
+                + backend->controlEntryDeltaOffset;
+            if (deltaOffset + sizeof(int) <= backend->controlBufferSize)
+                memcpy(&baseControl[deltaOffset], &g_app.freqOffsets[i], sizeof(int));
         }
+        if (!anyPending) break;
     }
 
     bool allOk = !batchFailed;
+    bool hasPending = false;
+    for (int i = 0; i < VF_NUM_POINTS; i++) {
+        if (!desiredMask[i]) continue;
+        if (driverRefused[i]) { pendingMask[i] = false; continue; }
+        if (g_app.freqOffsets[i] != desiredOffsets[i]) { pendingMask[i] = true; hasPending = true; }
+        else pendingMask[i] = false;
+    }
+
+    if (hasPending) {
+        // Everything the batch could not converge is written point by point.
+        for (int i = 0; i < VF_NUM_POINTS; i++) {
+            if (!pendingMask[i]) continue;
+            bool pointOk = nvapi_set_point(i, desiredOffsets[i]);
+            debug_log("curve fallback point %d target=%dkHz ok=%d (batch left readback=%dkHz)\n",
+                i, desiredOffsets[i], pointOk ? 1 : 0, g_app.freqOffsets[i]);
+            if (!pointOk) allOk = false; else anyWrite = true;
+        }
+        bool readOk = false;
+        for (int tryIdx = 0; tryIdx < 6; tryIdx++) {
+            if (tryIdx > 0) Sleep(10);
+            if (nvapi_read_offsets()) { readOk = true; break; }
+        }
+        if (!readOk) { allOk = false; readError = true; }
+    }
+
     if (anyWrite) {
-        // Brief settle wait -- driver needs ~1-2 frames to commit the new curve.
-        // 3 attempts x 10ms = 30ms max, fast enough to not block UI noticeably.
+        // The driver needs a moment to commit the new curve before the readback
+        // that the editor/graph will display is trustworthy.
         bool settledOk = false;
-        if (!read_live_curve_snapshot_settled(3, 10, &settledOk)) allOk = false;
+        if (!read_live_curve_snapshot_settled(3, 10, &settledOk)) { allOk = false; readError = true; }
         rebuild_visible_map();
     }
 
-    // Mark success/failure per point based on what the driver reported
+    int unconverged = 0;
     for (int i = 0; i < VF_NUM_POINTS; i++) {
-        if (!desiredMask[i]) continue;
-        if (g_app.freqOffsets[i] != desiredOffsets[i]) allOk = false;
+        if (!desiredMask[i] || driverRefused[i]) continue;
+        if (g_app.freqOffsets[i] != desiredOffsets[i]) {
+            allOk = false;
+            unconverged++;
+            debug_log("curve offset unconverged (final): ci=%d wrote=%dkHz readback=%dkHz\n",
+                i, desiredOffsets[i], g_app.freqOffsets[i]);
+        }
     }
-
+    // A rejected batch (Blackwell) is not a failure if the per-point fallback got
+    // every point to its target; only unconverged points or failed readbacks are.
+    if (unconverged == 0 && !readError) allOk = true;
+    debug_log("apply_curve_offsets_verified: desired=%d unconverged=%d allOk=%d\n",
+        desiredCount, unconverged, allOk ? 1 : 0);
     return allOk;
 }
 
@@ -4716,11 +4774,63 @@ static int displayed_curve_khz(unsigned int rawFreq_kHz) {
     return (int)v;
 }
 
+static void graph_set_pending_mhz(int ci, unsigned int mhz);
+static char g_applyClampNote[256] = {};
+
+// The driver keeps the VF curve non-decreasing: raising a point above the points to its
+// right silently lifts all of them (a flat tail at the boost ceiling goes up as a block).
+// To make "1 selected point = 1 changed point" true, a requested point is limited to the
+// lowest current frequency among the untouched points that follow it (up to the next
+// requested point). The limit is reported, and the edit box/graph show the limited value.
+static void limit_requested_points_to_untouched_neighbors(DesiredSettings* full, bool updateUi) {
+    if (updateUi) g_applyClampNote[0] = 0;
+    if (!full || full->hasLock) return;
+    int clamped = 0, firstCi = -1;
+    unsigned int firstWanted = 0, firstLimit = 0;
+    for (int ci = 0; ci < VF_NUM_POINTS; ci++) {
+        if (!full->hasCurvePoint[ci] || g_app.curve[ci].freq_kHz == 0) continue;
+        unsigned int limit = 0;  // 0 = no untouched neighbor constrains this point
+        const unsigned int curLive = displayed_curve_mhz(g_app.curve[ci].freq_kHz);
+        for (int cj = ci + 1; cj < VF_NUM_POINTS; cj++) {
+            if (g_app.curve[cj].freq_kHz == 0) continue;
+            if (full->hasCurvePoint[cj]) break;  // governed by its own target from here on
+            unsigned int liveJ = displayed_curve_mhz(g_app.curve[cj].freq_kHz);
+            // Idle/placeholder entries (below the operating range, e.g. ~400 MHz) are not
+            // part of the real curve and the driver does not lift them: never use them.
+            if (liveJ < (unsigned int)MIN_VISIBLE_FREQ_MHz) continue;
+            // A neighbor already below this point means the curve is not monotonic there;
+            // it is not a limit this edit could respect.
+            if (liveJ < curLive) continue;
+            if (limit == 0 || liveJ < limit) limit = liveJ;
+        }
+        // Never limit a point below where it already is: the limiter may only hold a raise back.
+        if (limit != 0 && limit < curLive) limit = curLive;
+        if (limit == 0 || full->curvePointMHz[ci] <= limit) continue;
+        if (clamped == 0) { firstCi = ci; firstWanted = full->curvePointMHz[ci]; firstLimit = limit; }
+        clamped++;
+        debug_log("limiter: point %d target %u -> %u MHz (point %d live=%u, lowest untouched neighbor to its right)\n",
+            ci, full->curvePointMHz[ci] + 0u, limit, ci, curLive);
+        full->curvePointMHz[ci] = limit;
+        if (updateUi) {
+            graph_set_pending_mhz(ci, limit);
+            for (int vi = 0; vi < g_app.numVisible; vi++) {
+                if (g_app.visibleMap[vi] == ci) { set_edit_value(g_app.hEditsMhz[vi], limit); break; }
+            }
+        }
+    }
+    if (clamped > 0) {
+        StringCchPrintfA(g_applyClampNote, ARRAY_COUNT(g_applyClampNote),
+            " Limited %d point(s) so the untouched points to their right stay put (e.g. point %d: %u -> %u MHz). Raise those points too to go higher.",
+            clamped, firstCi, firstWanted, firstLimit);
+    }
+}
+
 static bool capture_gui_apply_settings(DesiredSettings* desired, char* err, size_t errSize) {
     if (!desired) return false;
 
     DesiredSettings full = {};
     if (!capture_gui_desired_settings(&full, false, true, false, err, errSize)) return false;
+    limit_requested_points_to_untouched_neighbors(&full, true);
 
     DesiredSettings fanOnly = {};
     initialize_desired_settings_defaults(&fanOnly);
